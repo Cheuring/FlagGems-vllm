@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+megapreattention:
+  shape_desc: "global tokens, TP, hidden, Q heads, KV heads, head_dim, rotary_dim"
+  shapes:
+    - [32768, 2, 2048, 16, 2, 256, 64]
+    - [32768, 4, 2048, 16, 2, 256, 64]
+
 fp8_einsum:
   shapes:
     - [1, 8, 4096, 1024]
