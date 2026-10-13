@@ -130,6 +130,7 @@ class _MappedCommunicator:
         # tiles. A persistent consumer processes multiple tiles, so their count
         # is independent of the number of concurrently resident CTAs.
         self.handshake_words = producers * self.world
+        # Reserve per-row capacity; grouped publication uses only a prefix.
         self.ready_words = triton.cdiv(tokens, 128)
         self.flag_words = max(
             self.max_programs * self.world, self.handshake_words + self.ready_words
@@ -257,47 +258,49 @@ def _store_head(
             .to(tl.bfloat16)
             .to(tl.float32)
         )
-        frequency = cols % 32
+        frequency = tl.arange(0, 32)
         if READY_ROPE:
             co = tl.load(
                 cos + token[:, None] * 32 + frequency[None, :],
-                mask=valid[:, None] & (cols[None, :] < 64),
+                mask=valid[:, None],
                 other=1,
             ).to(tl.float32)
             si = tl.load(
                 sin + token[:, None] * 32 + frequency[None, :],
-                mask=valid[:, None] & (cols[None, :] < 64),
+                mask=valid[:, None],
                 other=0,
             ).to(tl.float32)
         else:
             axis = tl.where(
-                (frequency % 3 == 1) & (frequency <= 33),
+                frequency % 3 == 1,
                 1,
                 tl.where((frequency % 3 == 2) & (frequency <= 30), 2, 0),
             )
             pos = tl.load(
                 positions + axis[None, :] * POS_AXIS + token[:, None] * POS_TOKEN,
-                mask=valid[:, None] & (cols[None, :] < 64),
+                mask=valid[:, None],
                 other=0,
             ).to(tl.int64)
             co = tl.load(
                 rope + pos * ROPE_STRIDE + frequency[None, :],
-                mask=valid[:, None] & (cols[None, :] < 64),
+                mask=valid[:, None],
                 other=1,
             ).to(tl.float32)
             si = tl.load(
                 rope + pos * ROPE_STRIDE + 32 + frequency[None, :],
-                mask=valid[:, None] & (cols[None, :] < 64),
+                mask=valid[:, None],
                 other=0,
             ).to(tl.float32)
-        partner_indices = tl.broadcast_to(((cols + 32) % 64)[None, :], (BLOCK_M, 256))
-        partner = tl.gather(normalized, partner_indices, axis=1)
-        rotated = tl.where(
-            cols[None, :] < 32,
-            normalized * co - partner * si,
-            normalized * co + partner * si,
-        )
-        result = tl.where(cols[None, :] < 64, rotated, normalized)
+        # Only the first 64 dimensions rotate; pass the other 192 through.
+        # Static splits avoid a full-width gather and unused rotary arithmetic.
+        low128, high128 = tl.split(normalized.reshape(BLOCK_M, 2, 128).permute(0, 2, 1))
+        low64, high64 = tl.split(low128.reshape(BLOCK_M, 2, 64).permute(0, 2, 1))
+        first, second = tl.split(low64.reshape(BLOCK_M, 2, 32).permute(0, 2, 1))
+        first_out = first * co - second * si
+        second_out = second * co + first * si
+        rotated64 = tl.join(first_out, second_out).permute(0, 2, 1).reshape(BLOCK_M, 64)
+        result128 = tl.join(rotated64, high64).permute(0, 2, 1).reshape(BLOCK_M, 128)
+        result = tl.join(result128, high128).permute(0, 2, 1).reshape(BLOCK_M, 256)
         if is_key:
             tl.store(
                 key + token[:, None] * 256 + cols[None, :], result, mask=valid[:, None]
@@ -360,6 +363,7 @@ def _fused_projection(
     target,
     WORLD: tl.constexpr = 1,
     COMM: tl.constexpr = 0,
+    READY_GROUP: tl.constexpr = 1,
 ):
     num_n: tl.constexpr = 2 * Q_HEADS + 2
     k_tiles: tl.constexpr = 2048 // BK
@@ -380,19 +384,19 @@ def _fused_projection(
         seen = tl.full((), 0, tl.uint64)
         # The 32K policy uses an acquire read of the producers' acq_rel
         # arrival chain. It need not release the preceding output stores.
-        if COMM == 15:
+        if READY_GROUP > 1:
             while seen < target:
                 seen = tl.inline_asm_elementwise(
                     "ld.acquire.sys.global.u64 $0, [$1];",
                     constraints="=l,l",
-                    args=[ready + pm],
+                    args=[ready + pm // READY_GROUP],
                     dtype=tl.uint64,
                     is_pure=False,
                     pack=1,
                 )
         else:
             while seen < target:
-                seen = tl.load(ready + pm, volatile=True)
+                seen = tl.load(ready + pm // READY_GROUP, volatile=True)
             tl.inline_asm_elementwise(
                 "fence.acq_rel.sys; mov.u32 $0,0;",
                 constraints="=r",
@@ -402,8 +406,17 @@ def _fused_projection(
                 pack=1,
             )
         tl.debug_barrier()
+        # Producers fence multicast aliases before their acq_rel arrivals.
+        # The acquire above completes that alias-ordering path; TMA still
+        # needs the generic-to-async proxy fence. Keep the old policy elsewhere.
+        if READY_GROUP > 1:
+            fence: tl.constexpr = "fence.proxy.async.global; mov.u32 $0,0;"
+        else:
+            fence: tl.constexpr = (
+                "fence.proxy.alias; fence.proxy.async.global; mov.u32 $0,0;"
+            )
         tl.inline_asm_elementwise(
-            "fence.proxy.alias; fence.proxy.async.global; mov.u32 $0,0;",
+            fence,
             constraints="=r",
             args=[],
             dtype=tl.int32,
@@ -543,7 +556,13 @@ def _persistent(
             row_tile = row_chunk * GROUP
             pm = rank * (M // WORLD // BM) + row_tile
             src = source.to(tl.pointer_type(tl.uint32))
-            for block in tl.range(pid, tl.cdiv(BM * GROUP * 2048 // 8, BLOCK), COMM):
+            # Stage input loads asynchronously only for the validated 32K policy.
+            for block in tl.range(
+                pid,
+                tl.cdiv(BM * GROUP * 2048 // 8, BLOCK),
+                COMM,
+                num_stages=3 if GROUP > 1 else 1,
+            ):
                 group = block * BLOCK + tl.arange(0, BLOCK)
                 valid = group < BM * GROUP * 2048 // 8
                 offset = group * 4
@@ -578,26 +597,13 @@ def _persistent(
                 is_pure=False,
                 pack=1,
             )
-            # Publish a group only after every multicast store and fence.
-            # Each row tile still collects COMM acq_rel arrivals independently.
-            if GROUP == 1:
-                tl.atomic_add(
-                    destinations + flags + COMM * WORLD + pm,
-                    1,
-                    sem="acq_rel",
-                    scope="sys",
-                )
-            else:
-                tl.atomic_add(
-                    destinations[:, None]
-                    + flags
-                    + COMM * WORLD
-                    + pm
-                    + tl.arange(0, GROUP)[None, :],
-                    1,
-                    sem="acq_rel",
-                    scope="sys",
-                )
+            # All row tiles in this group become ready at the same time.
+            tl.atomic_add(
+                destinations + flags + COMM * WORLD + pm // GROUP,
+                1,
+                sem="acq_rel",
+                scope="sys",
+            )
     else:
         _fused_projection(
             a_desc,
@@ -635,15 +641,16 @@ def _persistent(
             (epoch + 1) * COMM,
             WORLD,
             COMM,
+            GROUP,
         )
 
 
 def _select_device_policy(tp, tokens, sm_count):
     """Validate the persistent scheduler before any collective allocation."""
-    # The validated 32K TP2/TP4 policy leaves 113 compute CTAs. An odd
-    # stride alternates the interleaved Q/K norm and gate/V copy tiles;
+    # Balance multicast progress against compute work for each 32K TP layout.
+    # Keep the compute stride odd so Q/K norm and gate/V copy tiles alternate;
     # an even stride permanently assigns expensive tiles to half the CTAs.
-    producers = 15 if tp in (2, 4) and tokens == 32768 else 8
+    producers = (13 if tp == 2 else 21) if tp in (2, 4) and tokens == 32768 else 8
     block = 256
     if tp not in (2, 4, 8) or tokens < 1024 or tokens % (tp * 128):
         raise NotImplementedError(
@@ -732,7 +739,7 @@ class _DevicePrefill:
             COMPUTE=self.compute_programs,
             BLOCK=self.block,
             BM=128,
-            GROUP=4 if self.comm_programs == 15 else 1,
+            GROUP=4 if t == 32768 and rt.world in (2, 4) else 1,
             num_warps=8,
         )
         self.resources = {
