@@ -76,6 +76,37 @@ class _Inputs:
 
 
 @triton.jit
+def _prepare_rope(
+    positions,
+    rope,
+    cos,
+    sin,
+    queue,
+    POS_AXIS,
+    POS_TOKEN,
+    ROPE_STRIDE,
+    M: tl.constexpr,
+    INITIAL: tl.constexpr,
+    BM: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid == 0:
+        tl.store(queue, INITIAL)
+    row = pid * BM + tl.arange(0, BM)
+    f = tl.arange(0, 32)
+    axis = tl.where(f % 3 == 1, 1, tl.where((f % 3 == 2) & (f <= 30), 2, 0))
+    pos = tl.load(
+        positions + axis[None, :] * POS_AXIS + row[:, None] * POS_TOKEN,
+        row[:, None] < M,
+        other=0,
+    ).to(tl.int64)
+    co = tl.load(rope + pos * ROPE_STRIDE + f[None, :], row[:, None] < M, other=1)
+    si = tl.load(rope + pos * ROPE_STRIDE + 32 + f[None, :], row[:, None] < M, other=0)
+    tl.store(cos + row[:, None] * 32 + f[None, :], co, row[:, None] < M)
+    tl.store(sin + row[:, None] * 32 + f[None, :], si, row[:, None] < M)
+
+
+@triton.jit
 def _initialize_metadata(flags, counters, WORDS: tl.constexpr):
     i = tl.program_id(0) * 1024 + tl.arange(0, 1024)
     tl.store(flags + i, 0, i < WORDS)
@@ -126,6 +157,11 @@ class _MappedCommunicator:
         self.rank = dist.get_rank(group)
         self.world = dist.get_world_size(group)
         self.count = tokens * hidden_size
+        self.cos = self.sin = self.work_queue = None
+        if hidden_size == 5120 and tokens == 32768 and self.world in (2, 4):
+            self.cos = torch.empty((tokens, 32), device="cuda", dtype=torch.bfloat16)
+            self.sin = torch.empty_like(self.cos)
+            self.work_queue = torch.empty((), device="cuda", dtype=torch.int32)
         self.max_programs = 128
         # Handshake slots belong to producer CTAs; ready slots belong to row
         # tiles. A persistent consumer processes multiple tiles, so their count
@@ -340,6 +376,8 @@ def _store_head(
 
 @triton.jit
 def _fused_projection(
+    work_queue,
+    first_tile,
     a_desc,
     b_desc,
     query,
@@ -379,6 +417,9 @@ def _fused_projection(
     COMM: tl.constexpr = 0,
     READY_GROUP: tl.constexpr = 1,
 ):
+    OPTIMIZED: tl.constexpr = (
+        HIDDEN == 5120 and M == 32768 and (WORLD == 2 or WORLD == 4)
+    )
     num_n: tl.constexpr = 2 * (Q_HEADS + KV_HEADS)
     k_tiles: tl.constexpr = HIDDEN // BK
     a = tle.gpu.alloc(
@@ -390,9 +431,8 @@ def _fused_projection(
     af = tle.gpu.alloc_barriers(NUM_SLOTS, expect_bytes=BM * BK * 2)
     bf = tle.gpu.alloc_barriers(NUM_SLOTS, expect_bytes=256 * BK * 2)
     seq = 0
-    for tile_id in tl.range(
-        tl.program_id(0) - COMM, tl.cdiv(M, BM) * num_n, NUM_PROGRAMS
-    ):
+    tile_id = first_tile
+    while tile_id < tl.cdiv(M, BM) * num_n:
         if HIDDEN == 5120 and M == 32768 and (WORLD == 2 or WORLD == 4):
             # Reuse each head pair across four row tiles while alternating
             # norm/RoPE and copy work. K/V pairs retain the packed K-all/V-all order.
@@ -527,10 +567,15 @@ def _fused_projection(
             BM,
         )
         seq += 1
+        if OPTIMIZED:
+            tile_id = tl.atomic_add(work_queue, 1, sem="relaxed")
+        else:
+            tile_id += NUM_PROGRAMS
 
 
 @triton.jit
 def _persistent(
+    work_queue,
     source,
     local,
     peers,
@@ -572,6 +617,9 @@ def _persistent(
     BM: tl.constexpr,
     GROUP: tl.constexpr,
 ):
+    OPTIMIZED: tl.constexpr = (
+        HIDDEN == 5120 and M == 32768 and (WORLD == 2 or WORLD == 4)
+    )
     pid = tl.program_id(0)
     epoch = tl.atomic_add(counters + pid, 1, sem="relaxed").to(tl.uint64)
     flags: tl.constexpr = M * HIDDEN // 4
@@ -607,28 +655,59 @@ def _persistent(
                 even, odd = tl.split(values.reshape(BLOCK, 2, 2))
                 x0, x2 = tl.split(even)
                 x1, x3 = tl.split(odd)
-                address = (
-                    multicast + (pm * (BM * HIDDEN // 2) + offset).to(tl.uint64) * 4
-                )
+                if OPTIMIZED:
+                    for destination in tl.static_range(WORLD):
+                        address = (
+                            tl.load(peers + destination)
+                            + (pm * (BM * HIDDEN // 2) + offset).to(tl.uint64) * 4
+                        )
+                        tl.inline_asm_elementwise(
+                            "{.reg .pred p; setp.ne.u32 p,$6,0; "
+                            "@p st.relaxed.sys.global.v4.u32 [$1],{$2,$3,$4,$5}; "
+                            "mov.u32 $0,0;}",
+                            constraints="=r,l,r,r,r,r,r",
+                            args=[address, x0, x1, x2, x3, valid.to(tl.int32)],
+                            dtype=tl.int32,
+                            is_pure=False,
+                            pack=1,
+                        )
+                else:
+                    address = (
+                        multicast + (pm * (BM * HIDDEN // 2) + offset).to(tl.uint64) * 4
+                    )
+                    tl.inline_asm_elementwise(
+                        "{.reg .pred p; setp.ne.u32 p,$6,0; "
+                        "@p multimem.st.relaxed.sys.global.v4.f32 [$1],{$2,$3,$4,$5}; "
+                        "mov.u32 $0,0;}",
+                        constraints="=r,l,r,r,r,r,r",
+                        args=[address, x0, x1, x2, x3, valid.to(tl.int32)],
+                        dtype=tl.int32,
+                        is_pure=False,
+                        pack=1,
+                    )
+            if OPTIMIZED:
+                # Every writing thread crosses the alias fence before the CTA
+                # barrier. Publication's system acq_rel RMW then releases the
+                # entire CTA's payload and chains the other producers' arrivals.
                 tl.inline_asm_elementwise(
-                    "{.reg .pred p; setp.ne.u32 p,$6,0; "
-                    "@p multimem.st.relaxed.sys.global.v4.f32 [$1],{$2,$3,$4,$5}; "
-                    "mov.u32 $0,0;}",
-                    constraints="=r,l,r,r,r,r,r",
-                    args=[address, x0, x1, x2, x3, valid.to(tl.int32)],
+                    "fence.proxy.alias; mov.u32 $0,0;",
+                    constraints="=r",
+                    args=[],
                     dtype=tl.int32,
                     is_pure=False,
                     pack=1,
                 )
-            tl.debug_barrier()
-            tl.inline_asm_elementwise(
-                "fence.proxy.alias; membar.sys; mov.u32 $0,0;",
-                constraints="=r",
-                args=[],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
+                tl.debug_barrier()
+            else:
+                tl.debug_barrier()
+                tl.inline_asm_elementwise(
+                    "fence.proxy.alias; membar.sys; mov.u32 $0,0;",
+                    constraints="=r",
+                    args=[],
+                    dtype=tl.int32,
+                    is_pure=False,
+                    pack=1,
+                )
             # All row tiles in this group become ready at the same time.
             tl.atomic_add(
                 destinations + flags + COMM * WORLD + pm // GROUP,
@@ -636,8 +715,15 @@ def _persistent(
                 sem="acq_rel",
                 scope="sys",
             )
+        first_tile = 0
+        if OPTIMIZED:
+            first_tile = tl.atomic_add(work_queue, 1, sem="relaxed")
     else:
+        first_tile = pid - COMM
+    if OPTIMIZED or pid >= COMM:
         _fused_projection(
+            work_queue,
+            first_tile,
             a_desc,
             b_desc,
             query,
@@ -686,7 +772,7 @@ def _select_device_policy(tp, tokens, sm_count, hidden_size=2048):
     # an even stride permanently assigns expensive tiles to half the CTAs.
     producers = (13 if tp == 2 else 21) if tp in (2, 4) and tokens == 32768 else 8
     if hidden_size == 5120 and tokens == 32768 and tp in (2, 4):
-        producers = 13 if tp == 2 else 9
+        producers = 9
     block = 256
     if tp not in (2, 4, 8) or tokens < 1024 or tokens % (tp * 128):
         raise NotImplementedError(
@@ -710,6 +796,9 @@ class _DevicePrefill:
         self.group = group
         self.tokens = tokens
         self.config = config
+        self.optimized = (
+            config.hidden_size == 5120 and tokens == 32768 and group.size() in (2, 4)
+        )
         self.comm_programs, self.block = _select_device_policy(
             group.size(),
             tokens,
@@ -752,7 +841,22 @@ class _DevicePrefill:
         q = x.hidden.new_empty((t, c.q_size))
         k = x.hidden.new_empty((t, c.kv_size))
         v, g = torch.empty_like(k), torch.empty_like(q)
+        if self.optimized:
+            _prepare_rope[(triton.cdiv(t, 128),)](
+                x.positions,
+                x.rope,
+                rt.cos,
+                rt.sin,
+                rt.work_queue,
+                *x.positions.stride(),
+                x.rope.stride(0),
+                M=t,
+                INITIAL=self.compute_programs,
+                BM=128,
+                num_warps=4,
+            )
         kernel = _persistent[(128,)](
+            rt.work_queue,
             x.hidden,
             rt.buffer,
             rt.peers,
@@ -769,8 +873,8 @@ class _DevicePrefill:
             x.k_norm,
             x.rope,
             x.positions,
-            x.cos,
-            x.sin,
+            rt.cos if self.optimized else x.cos,
+            rt.sin if self.optimized else x.sin,
             x.cache,
             x.slots,
             *x.positions.stride(),
@@ -783,7 +887,7 @@ class _DevicePrefill:
             KV_HEADS=c.num_kv_heads,
             HIDDEN=c.hidden_size,
             CACHE_BLOCK_SIZE=x.cache.shape[2],
-            READY_ROPE=False,
+            READY_ROPE=self.optimized,
             COMM=self.comm_programs,
             COMPUTE=self.compute_programs,
             BLOCK=self.block,
