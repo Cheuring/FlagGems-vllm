@@ -45,6 +45,10 @@ if not cfg.QUICK_MODE:
         (8, 1024, "operator", True),
         (2, 32768, "cudagraph", True),
         (4, 32768, "cudagraph", True),
+        (2, 1280, "cudagraph", True),
+        (4, 1536, "cudagraph", True),
+        (8, 2048, "cudagraph", True),
+        (8, 32768, "cudagraph", True),
     ]
 
 

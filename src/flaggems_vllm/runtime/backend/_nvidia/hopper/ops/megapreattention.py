@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TLE multicast tile-ready prefill, implemented entirely in this file.
+"""TLE peer-to-peer tile-ready prefill, implemented entirely in this file.
 
 Owns registration, signaling, projection, postprocessing and runtime lifetime.
 Requires 128 resident CTAs and complete M128 tiles. No other scheme is imported.
@@ -71,8 +71,6 @@ class _Inputs:
     slots: torch.Tensor
     group: object
     config: _Config
-    cos: torch.Tensor | None = None
-    sin: torch.Tensor | None = None
 
 
 @triton.jit
@@ -91,6 +89,7 @@ def _prepare_rope(
 ):
     pid = tl.program_id(0)
     if pid == 0:
+        # Compute CTAs own the initial IDs; all later work is claimed atomically.
         tl.store(queue, INITIAL)
     row = pid * BM + tl.arange(0, BM)
     f = tl.arange(0, 32)
@@ -157,11 +156,9 @@ class _MappedCommunicator:
         self.rank = dist.get_rank(group)
         self.world = dist.get_world_size(group)
         self.count = tokens * hidden_size
-        self.cos = self.sin = self.work_queue = None
-        if hidden_size == 5120 and tokens == 32768 and self.world in (2, 4):
-            self.cos = torch.empty((tokens, 32), device="cuda", dtype=torch.bfloat16)
-            self.sin = torch.empty_like(self.cos)
-            self.work_queue = torch.empty((), device="cuda", dtype=torch.int32)
+        self.cos = torch.empty((tokens, 32), device="cuda", dtype=torch.bfloat16)
+        self.sin = torch.empty_like(self.cos)
+        self.work_queue = torch.empty((), device="cuda", dtype=torch.int32)
         self.max_programs = 128
         # Handshake slots belong to producer CTAs; ready slots belong to row
         # tiles. A persistent consumer processes multiple tiles, so their count
@@ -200,10 +197,8 @@ class _MappedCommunicator:
             self.peers, tuple(self.mapping.buffer_ptrs), num_warps=1
         )
         assert all(p % 16 == 0 for p in self.mapping.buffer_ptrs)
-        self.mc_address = self.mapping.multicast_ptr or 0
         self.probe = {
             "backend": "PyTorch registration only; TLE data + synchronization",
-            "multicast": self.mc_address,
             "data_ptr": self.buffer.data_ptr(),
             "signal_words": self.flag_words,
             "handshake_words": self.handshake_words,
@@ -235,8 +230,6 @@ def _store_head(
     gate,
     qnorm,
     knorm,
-    rope,
-    positions,
     cos,
     sin,
     cache,
@@ -247,16 +240,12 @@ def _store_head(
     LOCAL_T: tl.constexpr,
     Q_HEADS: tl.constexpr,
     KV_HEADS: tl.constexpr,
-    POS_AXIS,
-    POS_TOKEN,
-    ROPE_STRIDE,
     SLOT_STRIDE,
     CACHE_BLOCK,
     CACHE_HEAD,
     CACHE_TOKEN,
     CACHE_DIM,
     CACHE_BLOCK_SIZE: tl.constexpr,
-    READY_ROPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     row = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -303,38 +292,16 @@ def _store_head(
             .to(tl.float32)
         )
         frequency = tl.arange(0, 32)
-        if READY_ROPE:
-            co = tl.load(
-                cos + token[:, None] * 32 + frequency[None, :],
-                mask=valid[:, None],
-                other=1,
-            ).to(tl.float32)
-            si = tl.load(
-                sin + token[:, None] * 32 + frequency[None, :],
-                mask=valid[:, None],
-                other=0,
-            ).to(tl.float32)
-        else:
-            axis = tl.where(
-                frequency % 3 == 1,
-                1,
-                tl.where((frequency % 3 == 2) & (frequency <= 30), 2, 0),
-            )
-            pos = tl.load(
-                positions + axis[None, :] * POS_AXIS + token[:, None] * POS_TOKEN,
-                mask=valid[:, None],
-                other=0,
-            ).to(tl.int64)
-            co = tl.load(
-                rope + pos * ROPE_STRIDE + frequency[None, :],
-                mask=valid[:, None],
-                other=1,
-            ).to(tl.float32)
-            si = tl.load(
-                rope + pos * ROPE_STRIDE + 32 + frequency[None, :],
-                mask=valid[:, None],
-                other=0,
-            ).to(tl.float32)
+        co = tl.load(
+            cos + token[:, None] * 32 + frequency[None, :],
+            mask=valid[:, None],
+            other=1,
+        ).to(tl.float32)
+        si = tl.load(
+            sin + token[:, None] * 32 + frequency[None, :],
+            mask=valid[:, None],
+            other=0,
+        ).to(tl.float32)
         # Only the first 64 dimensions rotate; pass the other 192 through.
         # Static splits avoid a full-width gather and unused rotary arithmetic.
         low128, high128 = tl.split(normalized.reshape(BLOCK_M, 2, 128).permute(0, 2, 1))
@@ -386,16 +353,11 @@ def _fused_projection(
     gate,
     qnorm,
     knorm,
-    rope,
-    positions,
     cos,
     sin,
     cache,
     slots,
     row_start,
-    POS_AXIS,
-    POS_TOKEN,
-    ROPE_STRIDE,
     SLOT_STRIDE,
     CACHE_BLOCK,
     CACHE_HEAD,
@@ -406,20 +368,15 @@ def _fused_projection(
     KV_HEADS: tl.constexpr,
     HIDDEN: tl.constexpr,
     CACHE_BLOCK_SIZE: tl.constexpr,
-    READY_ROPE: tl.constexpr,
     BM: tl.constexpr,
     BK: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
     ready,
     target,
     WORLD: tl.constexpr = 1,
-    COMM: tl.constexpr = 0,
     READY_GROUP: tl.constexpr = 1,
 ):
-    OPTIMIZED: tl.constexpr = (
-        HIDDEN == 5120 and M == 32768 and (WORLD == 2 or WORLD == 4)
-    )
+    ROW_GROUP: tl.constexpr = min(4, (M // BM) & -(M // BM))
     num_n: tl.constexpr = 2 * (Q_HEADS + KV_HEADS)
     k_tiles: tl.constexpr = HIDDEN // BK
     a = tle.gpu.alloc(
@@ -433,57 +390,32 @@ def _fused_projection(
     seq = 0
     tile_id = first_tile
     while tile_id < tl.cdiv(M, BM) * num_n:
-        if HIDDEN == 5120 and M == 32768 and (WORLD == 2 or WORLD == 4):
-            # Reuse each head pair across four row tiles while alternating
-            # norm/RoPE and copy work. K/V pairs retain the packed K-all/V-all order.
-            group_id = tile_id // (4 * num_n)
-            pair = (tile_id % (4 * num_n)) // 8
-            pm = group_id * 4 + (tile_id // 2) % 4
-            kind = tile_id % 2
-            pn = tl.where(
-                pair < Q_HEADS,
-                2 * pair + kind,
-                2 * Q_HEADS + pair - Q_HEADS + kind * KV_HEADS,
-            )
-        else:
-            pm, pn = tile_id // num_n, tile_id % num_n
+        # Reuse head pairs across a row group; the divisor also handles short tails.
+        group_id = tile_id // (ROW_GROUP * num_n)
+        within = tile_id % (ROW_GROUP * num_n)
+        pair = within // (2 * ROW_GROUP)
+        pm = group_id * ROW_GROUP + (within // 2) % ROW_GROUP
+        kind = tile_id % 2
+        pn = tl.where(
+            pair < Q_HEADS,
+            2 * pair + kind,
+            2 * Q_HEADS + pair - Q_HEADS + kind * KV_HEADS,
+        )
         pm = (pm % WORLD) * (M // WORLD // BM) + pm // WORLD
         seen = tl.full((), 0, tl.uint64)
-        # The 32K policy uses an acquire read of the producers' acq_rel
-        # arrival chain. It need not release the preceding output stores.
-        if READY_GROUP > 1:
-            while seen < target:
-                seen = tl.inline_asm_elementwise(
-                    "ld.acquire.sys.global.u64 $0, [$1];",
-                    constraints="=l,l",
-                    args=[ready + pm // READY_GROUP],
-                    dtype=tl.uint64,
-                    is_pure=False,
-                    pack=1,
-                )
-        else:
-            while seen < target:
-                seen = tl.load(ready + pm // READY_GROUP, volatile=True)
-            tl.inline_asm_elementwise(
-                "fence.acq_rel.sys; mov.u32 $0,0;",
-                constraints="=r",
-                args=[],
-                dtype=tl.int32,
+        # Acquire the complete producer arrival chain before TMA reads the payload.
+        while seen < target:
+            seen = tl.inline_asm_elementwise(
+                "ld.acquire.sys.global.u64 $0, [$1];",
+                constraints="=l,l",
+                args=[ready + pm // READY_GROUP],
+                dtype=tl.uint64,
                 is_pure=False,
                 pack=1,
             )
         tl.debug_barrier()
-        # Producers fence multicast aliases before their acq_rel arrivals.
-        # The acquire above completes that alias-ordering path; TMA still
-        # needs the generic-to-async proxy fence. Keep the old policy elsewhere.
-        if READY_GROUP > 1:
-            fence: tl.constexpr = "fence.proxy.async.global; mov.u32 $0,0;"
-        else:
-            fence: tl.constexpr = (
-                "fence.proxy.alias; fence.proxy.async.global; mov.u32 $0,0;"
-            )
         tl.inline_asm_elementwise(
-            fence,
+            "fence.proxy.async.global; mov.u32 $0,0;",
             constraints="=r",
             args=[],
             dtype=tl.int32,
@@ -542,8 +474,6 @@ def _fused_projection(
             gate,
             qnorm,
             knorm,
-            rope,
-            positions,
             cos,
             sin,
             cache,
@@ -554,23 +484,16 @@ def _fused_projection(
             M,
             Q_HEADS,
             KV_HEADS,
-            POS_AXIS,
-            POS_TOKEN,
-            ROPE_STRIDE,
             SLOT_STRIDE,
             CACHE_BLOCK,
             CACHE_HEAD,
             CACHE_TOKEN,
             CACHE_DIM,
             CACHE_BLOCK_SIZE,
-            READY_ROPE,
             BM,
         )
         seq += 1
-        if OPTIMIZED:
-            tile_id = tl.atomic_add(work_queue, 1, sem="relaxed")
-        else:
-            tile_id += NUM_PROGRAMS
+        tile_id = tl.atomic_add(work_queue, 1, sem="relaxed")
 
 
 @triton.jit
@@ -580,7 +503,6 @@ def _persistent(
     local,
     peers,
     counters,
-    multicast,
     rank,
     a_desc,
     b_desc,
@@ -590,15 +512,10 @@ def _persistent(
     gate,
     qnorm,
     knorm,
-    rope,
-    positions,
     cos,
     sin,
     cache,
     slots,
-    POS_AXIS,
-    POS_TOKEN,
-    ROPE_STRIDE,
     SLOT_STRIDE,
     CACHE_BLOCK,
     CACHE_HEAD,
@@ -610,16 +527,11 @@ def _persistent(
     KV_HEADS: tl.constexpr,
     HIDDEN: tl.constexpr,
     CACHE_BLOCK_SIZE: tl.constexpr,
-    READY_ROPE: tl.constexpr,
     COMM: tl.constexpr,
-    COMPUTE: tl.constexpr,
     BLOCK: tl.constexpr,
     BM: tl.constexpr,
     GROUP: tl.constexpr,
 ):
-    OPTIMIZED: tl.constexpr = (
-        HIDDEN == 5120 and M == 32768 and (WORLD == 2 or WORLD == 4)
-    )
     pid = tl.program_id(0)
     epoch = tl.atomic_add(counters + pid, 1, sem="relaxed").to(tl.uint64)
     flags: tl.constexpr = M * HIDDEN // 4
@@ -634,12 +546,12 @@ def _persistent(
             row_tile = row_chunk * GROUP
             pm = rank * (M // WORLD // BM) + row_tile
             src = source.to(tl.pointer_type(tl.uint32))
-            # Stage input loads asynchronously only for the validated 32K policy.
+            # Pipeline producer loads while publishing complete row groups.
             for block in tl.range(
                 pid,
                 tl.cdiv(BM * GROUP * HIDDEN // 8, BLOCK),
                 COMM,
-                num_stages=3 if GROUP > 1 else 1,
+                num_stages=3,
             ):
                 group = block * BLOCK + tl.arange(0, BLOCK)
                 valid = group < BM * GROUP * HIDDEN // 8
@@ -655,29 +567,14 @@ def _persistent(
                 even, odd = tl.split(values.reshape(BLOCK, 2, 2))
                 x0, x2 = tl.split(even)
                 x1, x3 = tl.split(odd)
-                if OPTIMIZED:
-                    for destination in tl.static_range(WORLD):
-                        address = (
-                            tl.load(peers + destination)
-                            + (pm * (BM * HIDDEN // 2) + offset).to(tl.uint64) * 4
-                        )
-                        tl.inline_asm_elementwise(
-                            "{.reg .pred p; setp.ne.u32 p,$6,0; "
-                            "@p st.relaxed.sys.global.v4.u32 [$1],{$2,$3,$4,$5}; "
-                            "mov.u32 $0,0;}",
-                            constraints="=r,l,r,r,r,r,r",
-                            args=[address, x0, x1, x2, x3, valid.to(tl.int32)],
-                            dtype=tl.int32,
-                            is_pure=False,
-                            pack=1,
-                        )
-                else:
+                for destination in tl.static_range(WORLD):
                     address = (
-                        multicast + (pm * (BM * HIDDEN // 2) + offset).to(tl.uint64) * 4
+                        tl.load(peers + destination)
+                        + (pm * (BM * HIDDEN // 2) + offset).to(tl.uint64) * 4
                     )
                     tl.inline_asm_elementwise(
                         "{.reg .pred p; setp.ne.u32 p,$6,0; "
-                        "@p multimem.st.relaxed.sys.global.v4.f32 [$1],{$2,$3,$4,$5}; "
+                        "@p st.relaxed.sys.global.v4.u32 [$1],{$2,$3,$4,$5}; "
                         "mov.u32 $0,0;}",
                         constraints="=r,l,r,r,r,r,r",
                         args=[address, x0, x1, x2, x3, valid.to(tl.int32)],
@@ -685,29 +582,18 @@ def _persistent(
                         is_pure=False,
                         pack=1,
                     )
-            if OPTIMIZED:
-                # Every writing thread crosses the alias fence before the CTA
-                # barrier. Publication's system acq_rel RMW then releases the
-                # entire CTA's payload and chains the other producers' arrivals.
-                tl.inline_asm_elementwise(
-                    "fence.proxy.alias; mov.u32 $0,0;",
-                    constraints="=r",
-                    args=[],
-                    dtype=tl.int32,
-                    is_pure=False,
-                    pack=1,
-                )
-                tl.debug_barrier()
-            else:
-                tl.debug_barrier()
-                tl.inline_asm_elementwise(
-                    "fence.proxy.alias; membar.sys; mov.u32 $0,0;",
-                    constraints="=r",
-                    args=[],
-                    dtype=tl.int32,
-                    is_pure=False,
-                    pack=1,
-                )
+            # Every writing thread crosses the alias fence before the CTA
+            # barrier. Publication's system acq_rel RMW then releases the
+            # entire CTA's payload and chains the other producers' arrivals.
+            tl.inline_asm_elementwise(
+                "fence.proxy.alias; mov.u32 $0,0;",
+                constraints="=r",
+                args=[],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+            tl.debug_barrier()
             # All row tiles in this group become ready at the same time.
             tl.atomic_add(
                 destinations + flags + COMM * WORLD + pm // GROUP,
@@ -715,64 +601,49 @@ def _persistent(
                 sem="acq_rel",
                 scope="sys",
             )
-        first_tile = 0
-        if OPTIMIZED:
-            first_tile = tl.atomic_add(work_queue, 1, sem="relaxed")
+        first_tile = tl.atomic_add(work_queue, 1, sem="relaxed")
     else:
         first_tile = pid - COMM
-    if OPTIMIZED or pid >= COMM:
-        _fused_projection(
-            work_queue,
-            first_tile,
-            a_desc,
-            b_desc,
-            query,
-            key,
-            value,
-            gate,
-            qnorm,
-            knorm,
-            rope,
-            positions,
-            cos,
-            sin,
-            cache,
-            slots,
-            0,
-            POS_AXIS,
-            POS_TOKEN,
-            ROPE_STRIDE,
-            SLOT_STRIDE,
-            CACHE_BLOCK,
-            CACHE_HEAD,
-            CACHE_TOKEN,
-            CACHE_DIM,
-            M,
-            Q_HEADS,
-            KV_HEADS,
-            HIDDEN,
-            CACHE_BLOCK_SIZE,
-            READY_ROPE,
-            BM,
-            64,
-            4,
-            COMPUTE,
-            ready,
-            (epoch + 1) * COMM,
-            WORLD,
-            COMM,
-            GROUP,
-        )
+    _fused_projection(
+        work_queue,
+        first_tile,
+        a_desc,
+        b_desc,
+        query,
+        key,
+        value,
+        gate,
+        qnorm,
+        knorm,
+        cos,
+        sin,
+        cache,
+        slots,
+        0,
+        SLOT_STRIDE,
+        CACHE_BLOCK,
+        CACHE_HEAD,
+        CACHE_TOKEN,
+        CACHE_DIM,
+        M,
+        Q_HEADS,
+        KV_HEADS,
+        HIDDEN,
+        CACHE_BLOCK_SIZE,
+        BM,
+        64,
+        4,
+        ready,
+        (epoch + 1) * COMM,
+        WORLD,
+        GROUP,
+    )
 
 
-def _select_device_policy(tp, tokens, sm_count, hidden_size=2048):
+def _select_device_policy(tp, tokens, sm_count):
     """Validate the persistent scheduler before any collective allocation."""
-    # Balance multicast progress against compute work for each 32K TP layout.
-    # Keep the compute stride odd so Q/K norm and gate/V copy tiles alternate;
-    # an even stride permanently assigns expensive tiles to half the CTAs.
-    producers = (13 if tp == 2 else 21) if tp in (2, 4) and tokens == 32768 else 8
-    if hidden_size == 5120 and tokens == 32768 and tp in (2, 4):
-        producers = 9
+    # Balance peer traffic and compute occupancy by group size, for either model.
+    producers = 13 if tp == 2 else 9
     block = 256
     if tp not in (2, 4, 8) or tokens < 1024 or tokens % (tp * 128):
         raise NotImplementedError(
@@ -782,7 +653,8 @@ def _select_device_policy(tp, tokens, sm_count, hidden_size=2048):
         raise NotImplementedError(
             "persistent TLE prefill requires at least 128 available SMs"
         )
-    return producers, block
+    row_group = 2 if tokens % (tp * 256) == 0 else 1
+    return producers, block, row_group
 
 
 class _DevicePrefill:
@@ -796,26 +668,17 @@ class _DevicePrefill:
         self.group = group
         self.tokens = tokens
         self.config = config
-        self.optimized = (
-            config.hidden_size == 5120 and tokens == 32768 and group.size() in (2, 4)
-        )
-        self.comm_programs, self.block = _select_device_policy(
+        self.comm_programs, self.block, self.row_group = _select_device_policy(
             group.size(),
             tokens,
             torch.cuda.get_device_properties(
                 torch.cuda.current_device()
             ).multi_processor_count,
-            config.hidden_size,
         )
         self.compute_programs = 128 - self.comm_programs
         self.communication = _MappedCommunicator(
             group, tokens, self.comm_programs, config.hidden_size
         )
-        if not self.communication.mc_address:
-            self.communication.close()
-            raise RuntimeError(
-                "multicast mapping unavailable; this implementation requires multicast support"
-            )
 
     def __call__(self, x):
         c, t, rt = x.config, self.tokens, self.communication
@@ -841,27 +704,25 @@ class _DevicePrefill:
         q = x.hidden.new_empty((t, c.q_size))
         k = x.hidden.new_empty((t, c.kv_size))
         v, g = torch.empty_like(k), torch.empty_like(q)
-        if self.optimized:
-            _prepare_rope[(triton.cdiv(t, 128),)](
-                x.positions,
-                x.rope,
-                rt.cos,
-                rt.sin,
-                rt.work_queue,
-                *x.positions.stride(),
-                x.rope.stride(0),
-                M=t,
-                INITIAL=self.compute_programs,
-                BM=128,
-                num_warps=4,
-            )
+        _prepare_rope[(triton.cdiv(t, 128),)](
+            x.positions,
+            x.rope,
+            rt.cos,
+            rt.sin,
+            rt.work_queue,
+            *x.positions.stride(),
+            x.rope.stride(0),
+            M=t,
+            INITIAL=self.compute_programs,
+            BM=128,
+            num_warps=4,
+        )
         kernel = _persistent[(128,)](
             rt.work_queue,
             x.hidden,
             rt.buffer,
             rt.peers,
             rt.counters,
-            rt.mc_address,
             rt.rank,
             TensorDescriptor.from_tensor(rt.buffer, [128, 64]),
             TensorDescriptor.from_tensor(x.weight, [256, 64]),
@@ -871,14 +732,10 @@ class _DevicePrefill:
             g,
             x.q_norm,
             x.k_norm,
-            x.rope,
-            x.positions,
-            rt.cos if self.optimized else x.cos,
-            rt.sin if self.optimized else x.sin,
+            rt.cos,
+            rt.sin,
             x.cache,
             x.slots,
-            *x.positions.stride(),
-            x.rope.stride(0),
             x.slots.stride(0),
             *x.cache.stride(),
             M=t,
@@ -887,16 +744,10 @@ class _DevicePrefill:
             KV_HEADS=c.num_kv_heads,
             HIDDEN=c.hidden_size,
             CACHE_BLOCK_SIZE=x.cache.shape[2],
-            READY_ROPE=self.optimized,
             COMM=self.comm_programs,
-            COMPUTE=self.compute_programs,
             BLOCK=self.block,
             BM=128,
-            GROUP=(
-                (2 if c.hidden_size == 5120 else 4)
-                if t == 32768 and rt.world in (2, 4)
-                else 1
-            ),
+            GROUP=self.row_group,
             num_warps=8,
         )
         self.resources = {
@@ -992,7 +843,6 @@ def _validate_input(inputs):
         tp,
         t,
         torch.cuda.get_device_properties(inputs.hidden.device).multi_processor_count,
-        c.hidden_size,
     )
 
 
