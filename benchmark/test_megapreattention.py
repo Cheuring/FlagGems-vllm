@@ -54,9 +54,12 @@ class MegaPreAttentionBenchmark(base.Benchmark):
     def get_latency(
         self, op, tokens, tp, hidden, q_heads, kv_heads, head_dim, rotary_dim
     ):
-        if (hidden, q_heads, kv_heads, head_dim, rotary_dim) != (2048, 16, 2, 256, 64):
+        if (hidden, q_heads, kv_heads) not in ((2048, 16, 2), (5120, 24, 4)) or (
+            head_dim,
+            rotary_dim,
+        ) != (256, 64):
             raise NotImplementedError(
-                "megapreattention currently supports the 35B dimensions only"
+                "megapreattention supports the 35B and 27B dimension sets only"
             )
         if not torch.cuda.is_available() or torch.cuda.device_count() < tp:
             pytest.skip(f"requires {tp} CUDA GPUs")
@@ -82,10 +85,16 @@ class MegaPreAttentionBenchmark(base.Benchmark):
             if any(a == "--iter" or a.startswith("--iter=") for a in sys.argv)
             else 100
         )
-        key = (tokens, tp, mode, warmup, iterations)
+        key = (tokens, tp, hidden, q_heads, kv_heads, mode, warmup, iterations)
         if key not in self.paired_results:
             self.paired_results[key] = run_distributed(
-                tp, tokens, mode, warmup=warmup, iterations=iterations, rounds=5
+                tp,
+                tokens,
+                mode,
+                warmup=warmup,
+                iterations=iterations,
+                rounds=5,
+                model_dims=(hidden, q_heads, kv_heads),
             )
         name = "native" if op == self.native else "megapreattention"
         return self.paired_results[key]["summary"][name]["latency_ms"]
