@@ -642,9 +642,10 @@ def _persistent(
 
 def _select_device_policy(tp, tokens, sm_count):
     """Validate the persistent scheduler before any collective allocation."""
-    # Balance peer traffic and compute occupancy by group size, for either model.
-    producers = 13 if tp == 2 else 9
-    block = 256
+    # Larger peer-copy chunks sustain throughput with fewer producer CTAs.
+    # Share this schedule across TP sizes and supported model layouts.
+    producers = 7
+    block = 1024
     if tp not in (2, 4, 8) or tokens < 1024 or tokens % (tp * 128):
         raise NotImplementedError(
             "TLE prefill requires TP2/TP4/TP8, T>=1024 and complete 128-row tiles per rank"
