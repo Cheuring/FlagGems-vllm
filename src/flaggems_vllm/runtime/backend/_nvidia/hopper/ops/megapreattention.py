@@ -343,6 +343,8 @@ def _store_head(
 
 @triton.jit
 def _fused_projection(
+    BULK_END: tl.constexpr,
+    STRIDE: tl.constexpr,
     work_queue,
     first_tile,
     a_desc,
@@ -493,11 +495,16 @@ def _fused_projection(
             BM,
         )
         seq += 1
-        tile_id = tl.atomic_add(work_queue, 1, sem="relaxed")
+        # Static owners cover disjoint strided tiles, then help drain the tail.
+        if tile_id < BULK_END and tile_id + STRIDE < BULK_END:
+            tile_id += STRIDE
+        else:
+            tile_id = tl.atomic_add(work_queue, 1, sem="relaxed")
 
 
 @triton.jit
 def _persistent(
+    BULK_END: tl.constexpr,
     work_queue,
     source,
     local,
@@ -604,7 +611,11 @@ def _persistent(
         first_tile = tl.atomic_add(work_queue, 1, sem="relaxed")
     else:
         first_tile = pid - COMM
+        if first_tile >= BULK_END:
+            first_tile = tl.atomic_add(work_queue, 1, sem="relaxed")
     _fused_projection(
+        BULK_END,
+        128 - COMM,
         work_queue,
         first_tile,
         a_desc,
@@ -702,6 +713,10 @@ class _DevicePrefill:
             raise NotImplementedError(
                 "DevicePrefill requires BF16, head_dim=256 and one or two local KV heads"
             )
+        # Keep a dynamic tail for producers after communication and for load balance.
+        # Align the static prefix so every compute CTA owns the same tile count.
+        num_tiles = (t // 128) * 2 * (c.num_q_heads + c.num_kv_heads)
+        bulk = (num_tiles * 7 // 8 // self.compute_programs) * self.compute_programs
         q = x.hidden.new_empty((t, c.q_size))
         k = x.hidden.new_empty((t, c.kv_size))
         v, g = torch.empty_like(k), torch.empty_like(q)
@@ -714,11 +729,12 @@ class _DevicePrefill:
             *x.positions.stride(),
             x.rope.stride(0),
             M=t,
-            INITIAL=self.compute_programs,
+            INITIAL=bulk,
             BM=128,
             num_warps=4,
         )
         kernel = _persistent[(128,)](
+            bulk,
             rt.work_queue,
             x.hidden,
             rt.buffer,
