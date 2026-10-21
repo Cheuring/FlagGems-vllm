@@ -45,6 +45,7 @@ class Config:
     rotary_dim: int = 64
     mrope_section: tuple[int, int, int] = (11, 11, 10)
     eps: float = 1e-6
+    global_kv_heads: int = 2
 
     @property
     def q_size(self):
@@ -86,7 +87,8 @@ class Output:
         return self.query, self.key, self.value, self.gate
 
 
-def load_fixture(path=None):
+def load_fixture(path=None, model_dims=(2048, 16, 2)):
+    hidden_size, q_heads, kv_heads = model_dims
     if path is not None:
         fixture = torch.load(path, map_location="cpu", weights_only=True)
         for name, tensor in fixture["weights"].items():
@@ -94,19 +96,31 @@ def load_fixture(path=None):
                 tensor.contiguous().view(torch.uint8).numpy().tobytes()
             ).hexdigest()
             assert digest == fixture["metadata"]["weight_sha256"][name]
+        expected = {
+            "q_proj.weight": (2 * q_heads * 256, hidden_size),
+            "k_proj.weight": (kv_heads * 256, hidden_size),
+            "v_proj.weight": (kv_heads * 256, hidden_size),
+            "q_norm.weight": (256,),
+            "k_norm.weight": (256,),
+        }
+        for name, shape in expected.items():
+            if tuple(fixture["weights"][name].shape) != shape:
+                raise ValueError(
+                    f"fixture {name} does not match model dimensions {model_dims}"
+                )
         return fixture
     generator = torch.Generator().manual_seed(20261010)
     weights = {
         "q_proj.weight": torch.randn(
-            8192, 2048, generator=generator, dtype=torch.bfloat16
+            2 * q_heads * 256, hidden_size, generator=generator, dtype=torch.bfloat16
         )
         * 0.02,
         "k_proj.weight": torch.randn(
-            512, 2048, generator=generator, dtype=torch.bfloat16
+            kv_heads * 256, hidden_size, generator=generator, dtype=torch.bfloat16
         )
         * 0.02,
         "v_proj.weight": torch.randn(
-            512, 2048, generator=generator, dtype=torch.bfloat16
+            kv_heads * 256, hidden_size, generator=generator, dtype=torch.bfloat16
         )
         * 0.02,
         "q_norm.weight": torch.randn(256, generator=generator, dtype=torch.bfloat16)
@@ -138,7 +152,7 @@ def run_candidate(inputs):
             inputs.slots,
             inputs.group,
             num_heads=c.num_q_heads * inputs.group.size(),
-            num_kv_heads=2,
+            num_kv_heads=c.global_kv_heads,
             head_dim=c.head_dim,
             rotary_dim=c.rotary_dim,
             mrope_section=c.mrope_section,
@@ -147,24 +161,26 @@ def run_candidate(inputs):
     )
 
 
-def make_inputs(tokens, tp, rank, fixture, *, edge=False):
+def make_inputs(tokens, tp, rank, fixture, *, edge=False, model_dims=(2048, 16, 2)):
     from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 
-    config = Config(16 // tp, 1)
+    hidden_size, q_heads, kv_heads = model_dims
+    config = Config(q_heads // tp, max(1, kv_heads // tp), global_kv_heads=kv_heads)
     weights = fixture["weights"]
-    qwidth = 16 * 256 * 2 // tp
-    kv_rank = rank // (tp // 2)
+    qwidth = q_heads * 256 * 2 // tp
+    kv_rank = rank // max(1, tp // kv_heads)
+    kv_start = kv_rank * config.kv_size
     local = torch.cat(
         (
             weights["q_proj.weight"][rank * qwidth : (rank + 1) * qwidth],
-            weights["k_proj.weight"][kv_rank * 256 : (kv_rank + 1) * 256],
-            weights["v_proj.weight"][kv_rank * 256 : (kv_rank + 1) * 256],
+            weights["k_proj.weight"][kv_start : kv_start + config.kv_size],
+            weights["v_proj.weight"][kv_start : kv_start + config.kv_size],
         )
     ).to("cuda")
     generator = torch.Generator(device="cuda").manual_seed(20261010 + rank + tokens)
     hidden = (
         torch.randn(
-            (tokens // tp, 2048),
+            (tokens // tp, hidden_size),
             dtype=torch.bfloat16,
             device="cuda",
             generator=generator,
@@ -189,11 +205,17 @@ def make_inputs(tokens, tp, rank, fixture, *, edge=False):
     count = tokens * 2 + 128 if edge else tokens + 128
     blocks = (count + 127) // 128
     cache = torch.full(
-        (blocks, 1, 128, 512), 0.375, device="cuda", dtype=torch.bfloat16
+        (blocks, config.num_kv_heads, 128, 512),
+        0.375,
+        device="cuda",
+        dtype=torch.bfloat16,
     )
     if edge:
         cache = torch.full(
-            (128, 1, blocks, 512), 0.375, device="cuda", dtype=torch.bfloat16
+            (128, config.num_kv_heads, blocks, 512),
+            0.375,
+            device="cuda",
+            dtype=torch.bfloat16,
         ).permute(2, 1, 0, 3)
     rope = MRotaryEmbedding(
         256,
@@ -246,9 +268,9 @@ class NativeWindow:
             use_fused_qk_norm_rope_gate=not edge,
             attn_output_gate=True,
             q_size=inputs.config.q_size,
-            kv_size=256,
+            kv_size=inputs.config.kv_size,
             num_heads=inputs.config.num_q_heads,
-            num_kv_heads=1,
+            num_kv_heads=inputs.config.num_kv_heads,
             head_dim=256,
             q_norm=qnorm_call,
             k_norm=knorm_call,
@@ -276,8 +298,8 @@ class NativeWindow:
         q, k, v, gate = self.method(self.context, qkv, positions)
         key_cache, value_cache = cache.transpose(1, 2).split(256, dim=-1)
         self.cache_op(
-            k.view(-1, 1, 256),
-            v.view(-1, 1, 256),
+            k.view(-1, self.context.num_kv_heads, 256),
+            v.view(-1, self.context.num_kv_heads, 256),
             key_cache,
             value_cache,
             slots,
@@ -300,10 +322,10 @@ class NativeWindow:
 def independent_reference(inputs):
     """Oracle starts at original shards; never reads candidate scratch/results."""
     c, t = inputs.config, inputs.positions.shape[1]
-    hidden = inputs.hidden.new_empty((t, 2048))
+    hidden = inputs.hidden.new_empty((t, inputs.hidden.shape[1]))
     dist.all_gather_into_tensor(hidden, inputs.hidden, group=inputs.group)
     qkv = hidden @ inputs.weight.t()
-    qgate, key, value = qkv.split((2 * c.q_size, 256, 256), dim=-1)
+    qgate, key, value = qkv.split((2 * c.q_size, c.kv_size, c.kv_size), dim=-1)
     query, gate = qgate.view(t, c.num_q_heads, 512).chunk(2, dim=-1)
     frequency = torch.arange(32, device="cuda")
     axis = torch.zeros_like(frequency)
@@ -330,13 +352,13 @@ def independent_reference(inputs):
         return torch.cat((rotated, normalized[..., 64:]), dim=-1).to(torch.bfloat16)
 
     query = norm_rope(query, inputs.q_norm).reshape(t, c.q_size)
-    key = norm_rope(key.view(t, 1, 256), inputs.k_norm)
+    key = norm_rope(key.view(t, c.num_kv_heads, 256), inputs.k_norm)
     valid = inputs.slots >= 0
     slots = inputs.slots[valid]
     block, offset = slots // inputs.cache.shape[2], slots % inputs.cache.shape[2]
     inputs.cache[block, :, offset, :256] = key[valid]
-    inputs.cache[block, :, offset, 256:] = value.view(t, 1, 256)[valid]
-    return Output(query, key.reshape(t, 256), value, gate)
+    inputs.cache[block, :, offset, 256:] = value.view(t, c.num_kv_heads, 256)[valid]
+    return Output(query, key.reshape(t, c.kv_size), value, gate)
 
 
 def check_outputs(actual, expected, actual_cache, expected_cache):
@@ -385,6 +407,7 @@ def _worker(
     check_only,
     directory,
     fixture_path,
+    model_dims,
 ):
     import torch
     import torch.distributed as dist
@@ -405,8 +428,10 @@ def _worker(
 
     native_context = set_current_vllm_config(VllmConfig())
     native_context.__enter__()
-    fixture = load_fixture(fixture_path)
-    source, rope = make_inputs(tokens, tp, rank, fixture, edge=edge)
+    fixture = load_fixture(fixture_path, model_dims)
+    source, rope = make_inputs(
+        tokens, tp, rank, fixture, edge=edge, model_dims=model_dims
+    )
     from flaggems_vllm.runtime.backend._nvidia.hopper.ops import (
         megapreattention as impl,
     )
@@ -490,7 +515,9 @@ def _worker(
             "strided_hidden": replace(
                 value,
                 hidden=torch.empty(
-                    (tokens // tp, 4096), device="cuda", dtype=torch.bfloat16
+                    (tokens // tp, value.hidden.shape[1] * 2),
+                    device="cuda",
+                    dtype=torch.bfloat16,
                 )[:, ::2],
             ),
             "requires_grad": replace(
@@ -626,9 +653,13 @@ def run_distributed(
     edge=False,
     check_only=False,
     fixture_path=None,
+    model_dims=(2048, 16, 2),
 ):
     import torch.multiprocessing as mp
 
+    model_dims = tuple(model_dims)
+    if model_dims not in ((2048, 16, 2), (5120, 24, 4)):
+        raise ValueError(f"unsupported model dimensions: {model_dims}")
     reports = []
     for round_index in range(rounds):
         with tempfile.TemporaryDirectory(prefix="megapreattention-") as directory:
@@ -644,6 +675,7 @@ def run_distributed(
                     check_only,
                     directory,
                     fixture_path,
+                    model_dims,
                 ),
                 nprocs=tp,
                 join=False,
@@ -691,6 +723,7 @@ def run_distributed(
                 summary["native"]["stable_all"] and summary[name]["stable_all"]
             )
     result = {
+        "model_dims": model_dims,
         "tp": tp,
         "tokens": tokens,
         "mode": mode,
