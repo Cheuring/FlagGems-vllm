@@ -14,8 +14,6 @@
 
 """Distributed accuracy, Graph replay and input-contract coverage."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -28,13 +26,8 @@ pytestmark = pytest.mark.megapreattention
 def require_hopper(tp=1):
     if not torch.cuda.is_available() or torch.cuda.device_count() < tp:
         pytest.skip(f"requires {tp} CUDA GPUs")
-    if any(
-        torch.cuda.get_device_capability(i) != (9, 0)
-        or torch.cuda.get_device_properties(i).multi_processor_count < 128
-        for i in range(tp)
-    ):
-        pytest.skip("requires SM90 GPUs with at least 128 SMs")
-    pytest.importorskip("triton.experimental.tle.language")
+    if any(torch.cuda.get_device_capability(i) != (9, 0) for i in range(tp)):
+        pytest.skip("requires SM90 GPUs")
 
 
 # The shared worker checks changed-input Graph replay and poisoned transport.
@@ -96,27 +89,26 @@ def test_megapreattention_metadata_bounds(words, programs):
 
 
 @pytest.mark.parametrize(
-    "dimension,value",
+    "dimension,value,error,message",
     [
-        ("hidden_size", 0),
-        ("num_heads", 3),
-        ("num_kv_heads", 3),
-        ("head_dim", 0),
-        ("rotary_dim", 65),
-        ("mrope_section", (-1, 11, 22)),
-        ("eps", -1e-5),
-        ("tp", 1),
+        ("hidden_size", 0, NotImplementedError, "positive hidden width"),
+        ("num_heads", 3, NotImplementedError, "Q head count divisible by TP"),
+        ("num_kv_heads", 3, NotImplementedError, "sharded or replicated KV heads"),
+        ("head_dim", 0, ValueError, "rotary_dim must be even"),
+        ("rotary_dim", 65, ValueError, "rotary_dim must be even"),
+        ("mrope_section", (-1, 11, 22), ValueError, "nonnegative MRoPE sections"),
+        ("eps", -1e-5, ValueError, "eps must be finite and nonnegative"),
+        ("tp", 1, NotImplementedError, "requires TP2/TP4/TP8"),
     ],
 )
-def test_megapreattention_rejects_incompatible_metadata_before_collectives(
-    dimension, value
-):
+def test_megapreattention_rejects_incompatible_config(dimension, value, error, message):
     from flaggems_vllm.runtime.backend._nvidia.hopper.ops.megapreattention import (
-        megapreattention,
+        _validate_config,
     )
 
-    hidden_size = value if dimension == "hidden_size" else 2048
-    dims = dict(
+    config = dict(
+        hidden_size=2048,
+        tp=2,
         num_heads=16,
         num_kv_heads=2,
         head_dim=256,
@@ -124,24 +116,22 @@ def test_megapreattention_rejects_incompatible_metadata_before_collectives(
         mrope_section=(11, 11, 10),
         eps=1e-6,
     )
-    tp = value if dimension == "tp" else 2
-    if dimension in dims:
-        dims[dimension] = value
-    # CPU metadata is sufficient: do not initialize ranks or allocate on CUDA.
-    hidden, dummy = torch.empty(0, hidden_size), torch.empty(0)
-    with pytest.raises((ValueError, NotImplementedError)):
-        megapreattention(
-            hidden,
-            dummy,
-            dummy,
-            dummy,
-            dummy,
-            dummy,
-            dummy,
-            dummy,
-            SimpleNamespace(size=lambda: tp),
-            **dims,
-        )
+    config[dimension] = value
+    with pytest.raises(error, match=message):
+        _validate_config(**config)
+
+
+def test_megapreattention_general_dispatch_without_fast_path(monkeypatch):
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops import (
+        megapreattention as impl,
+    )
+
+    config = impl._validate_config(2048, 2, 16, 2, 256, 64, (11, 11, 10), 1e-6)
+    monkeypatch.setattr(impl, "tle", object())
+    assert impl._use_persistent_path(config, 1024, 2, 128)
+    assert not impl._use_persistent_path(config, 1024, 2, 120)
+    monkeypatch.setattr(impl, "tle", None)
+    assert not impl._use_persistent_path(config, 1024, 2, 132)
 
 
 GENERAL_CASES = [
@@ -178,6 +168,7 @@ def test_megapreattention_general_geometry(
         rotary_dim=rotary_dim,
         mrope_section=sections,
         eps=eps,
+        disable_tle=(tp == 2 and head_dim == 256),
     )
     assert result["correctness_passed"]
     assert result["measurement_jit_free"]

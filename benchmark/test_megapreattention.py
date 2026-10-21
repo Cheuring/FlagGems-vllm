@@ -56,13 +56,8 @@ class MegaPreAttentionBenchmark(base.Benchmark):
     ):
         if not torch.cuda.is_available() or torch.cuda.device_count() < tp:
             pytest.skip(f"requires {tp} CUDA GPUs")
-        if any(
-            torch.cuda.get_device_capability(i) != (9, 0)
-            or torch.cuda.get_device_properties(i).multi_processor_count < 128
-            for i in range(tp)
-        ):
-            pytest.skip("requires SM90 GPUs with at least 128 SMs")
-        pytest.importorskip("triton.experimental.tle.language")
+        if any(torch.cuda.get_device_capability(i) != (9, 0) for i in range(tp)):
+            pytest.skip("requires SM90 GPUs")
         mode = Config.mode.value
         if mode not in ("kernel", "operator", "cudagraph"):
             raise ValueError(

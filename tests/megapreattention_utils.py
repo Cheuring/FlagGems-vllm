@@ -458,6 +458,7 @@ def _worker(
     fixture_path,
     model_dims,
     kernel_config,
+    disable_tle=False,
 ):
     import torch
     import torch.distributed as dist
@@ -486,13 +487,36 @@ def _worker(
         megapreattention as impl,
     )
 
+    if disable_tle:
+        impl.tle = None
+
     names = ["native", "megapreattention"]
     inputs = {
         name: replace(source, cache=torch.full_like(source.cache, 0.375))
         for name in names
     }
     native = NativeWindow(inputs["native"], rope, edge=edge)
-    functions = {"native": native, "megapreattention": run_candidate}
+
+    def candidate_with_other_current_device(value):
+        # Exercise creation, cached calls and Graph capture with a different
+        # current device. The API must restore the caller's device on return.
+        other = (rank + 1) % tp
+        with torch.cuda.device(other):
+            result = run_candidate(value)
+            assert torch.cuda.current_device() == other
+        assert all(tensor.device == value.hidden.device for tensor in result.tensors())
+        assert all(
+            w.communication.device == value.hidden.device
+            for w in impl._windows.values()
+        )
+        return result
+
+    functions = {
+        "native": native,
+        "megapreattention": (
+            candidate_with_other_current_device if check_only else run_candidate
+        ),
+    }
     # Original-input oracle is independent of both native and candidate scratch.
     oracle_cache = torch.full_like(source.cache, 0.375)
     oracle = independent_reference(replace(source, cache=oracle_cache))
@@ -558,7 +582,14 @@ def _worker(
             )
     # Unsupported metadata is rejected before any collective initialization.
     unsupported = {}
-    for name in ("megapreattention",):
+    check_metadata = (
+        check_only
+        and tp == 2
+        and tokens == 1024
+        and model_dims == (2048, 16, 2)
+        and kernel_config["eps"] == 1e-6
+    )
+    for name in ("megapreattention",) if check_metadata else ():
         value = inputs[name]
         bad_cases = {
             "fp32": replace(value, hidden=value.hidden.float()),
@@ -646,7 +677,9 @@ def _worker(
     outputs.clear()
     graphs.clear()
     calls.clear()
-    impl.clear_megapreattention_cache()
+    with torch.cuda.device((rank + 1) % tp):
+        impl.clear_megapreattention_cache()
+        assert torch.cuda.current_device() == (rank + 1) % tp
     if rank == 0:
         metrics = {}
         if not check_only:
@@ -702,6 +735,7 @@ def run_distributed(
     rotary_dim=64,
     mrope_section=(11, 11, 10),
     eps=1e-6,
+    disable_tle=False,
 ):
     import torch.multiprocessing as mp
 
@@ -734,6 +768,7 @@ def run_distributed(
                     fixture_path,
                     model_dims,
                     kernel_config,
+                    disable_tle,
                 ),
                 nprocs=tp,
                 join=False,
@@ -783,6 +818,7 @@ def run_distributed(
     result = {
         "model_dims": model_dims,
         "kernel_config": kernel_config,
+        "disable_tle": disable_tle,
         "tp": tp,
         "tokens": tokens,
         "mode": mode,

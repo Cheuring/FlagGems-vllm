@@ -14,9 +14,13 @@
 
 """TLE peer-to-peer tile-ready prefill, implemented entirely in this file.
 
-Owns registration, signaling, projection, postprocessing and runtime lifetime.
+Owns peer registration, signaling, projection, postprocessing and runtime lifetime.
 The optimized persistent grid requires at least 128 SMs and complete M128
 input tiles. Other head geometries use a general Triton implementation.
+
+This backend-local candidate exposes its callable API directly from this module.
+Top-level exports and aten registration are intentionally omitted until generic
+vLLM integration; there is no corresponding aten schema.
 """
 
 import math
@@ -168,6 +172,7 @@ class _MappedCommunicator:
     ):
         from torch._C._distributed_c10d import _SymmetricMemory
 
+        self.device = torch.device("cuda", torch.cuda.current_device())
         self.group = group
         self.rank = dist.get_rank(group)
         self.world = dist.get_world_size(group)
@@ -230,12 +235,13 @@ class _MappedCommunicator:
         dist.barrier(group=group)
 
     def close(self):
-        torch.cuda.synchronize()
-        dist.barrier(group=self.group)
-        self.buffer = None
-        self.flags = None
-        self.mapping = None
-        self.allocation = None
+        with torch.cuda.device(self.device):
+            torch.cuda.synchronize()
+            dist.barrier(group=self.group)
+            self.buffer = None
+            self.flags = None
+            self.mapping = None
+            self.allocation = None
 
 
 @triton.jit
@@ -1337,6 +1343,45 @@ def _validate_input(inputs):
 _windows = {}
 
 
+def _validate_config(
+    hidden_size, tp, num_heads, num_kv_heads, head_dim, rotary_dim, mrope_section, eps
+):
+    if tp not in (2, 4, 8):
+        raise NotImplementedError("megapreattention requires TP2/TP4/TP8")
+    if hidden_size <= 0:
+        raise NotImplementedError("megapreattention requires a positive hidden width")
+    if num_heads <= 0 or num_heads % tp:
+        raise NotImplementedError(
+            "megapreattention requires a positive Q head count divisible by TP"
+        )
+    if num_kv_heads <= 0 or (
+        num_kv_heads % tp if num_kv_heads >= tp else tp % num_kv_heads
+    ):
+        raise NotImplementedError(
+            "megapreattention requires evenly sharded or replicated KV heads"
+        )
+    if head_dim <= 0 or rotary_dim < 0 or rotary_dim > head_dim or rotary_dim % 2:
+        raise ValueError("rotary_dim must be even and between zero and head_dim")
+    sections = tuple(mrope_section)
+    if (
+        len(sections) != 3
+        or any(not isinstance(part, int) or part < 0 for part in sections)
+        or sum(sections) != rotary_dim // 2
+    ):
+        raise ValueError("three nonnegative MRoPE sections must sum to rotary_dim/2")
+    if not math.isfinite(eps) or eps < 0:
+        raise ValueError("eps must be finite and nonnegative")
+    return _Config(
+        num_heads // tp,
+        max(1, num_kv_heads // tp),
+        head_dim,
+        rotary_dim,
+        sections,
+        eps,
+        hidden_size,
+    )
+
+
 def megapreattention(
     hidden,
     weight,
@@ -1388,46 +1433,24 @@ def megapreattention(
 
     No online autotune: producer CTA counts and ready-signal layouts must match
     on all ranks. Independent per-rank tuning can deadlock this protocol.
-    The validated offline policy is kept in _select_device_policy.
+    The validated offline policy is kept in _select_device_policy. The general
+    projection uses fixed tiles as part of this collective runtime; it is also
+    exempt from per-rank online tuning to keep initialization/capture ordered.
     """
     if hidden.ndim != 2:
         raise NotImplementedError(
             "megapreattention requires rank-local [T/TP,H] hidden"
         )
     tp = group.size()
-    if tp not in (2, 4, 8):
-        raise NotImplementedError("megapreattention requires TP2/TP4/TP8")
-    if hidden.shape[1] <= 0:
-        raise NotImplementedError("megapreattention requires a positive hidden width")
-    if num_heads <= 0 or num_heads % tp:
-        raise NotImplementedError(
-            "megapreattention requires a positive Q head count divisible by TP"
-        )
-    if num_kv_heads <= 0 or (
-        num_kv_heads % tp if num_kv_heads >= tp else tp % num_kv_heads
-    ):
-        raise NotImplementedError(
-            "megapreattention requires evenly sharded or replicated KV heads"
-        )
-    if head_dim <= 0 or rotary_dim < 0 or rotary_dim > head_dim or rotary_dim % 2:
-        raise ValueError("rotary_dim must be even and between zero and head_dim")
-    sections = tuple(mrope_section)
-    if (
-        len(sections) != 3
-        or any(not isinstance(part, int) or part < 0 for part in sections)
-        or sum(sections) != rotary_dim // 2
-    ):
-        raise ValueError("three nonnegative MRoPE sections must sum to rotary_dim/2")
-    if not math.isfinite(eps) or eps < 0:
-        raise ValueError("eps must be finite and nonnegative")
-    config = _Config(
-        num_heads // tp,
-        max(1, num_kv_heads // tp),
+    config = _validate_config(
+        hidden.shape[1],
+        tp,
+        num_heads,
+        num_kv_heads,
         head_dim,
         rotary_dim,
-        sections,
+        mrope_section,
         eps,
-        hidden.shape[1],
     )
     inputs = _Inputs(
         hidden,
@@ -1448,17 +1471,20 @@ def megapreattention(
             "tokens must be positive and evenly sharded across TP"
         )
     key = (id(group), tokens, hidden.device, config)
-    if key not in _windows:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("warm up this shape before capture")
-        sm_count = torch.cuda.get_device_properties(hidden.device).multi_processor_count
-        runtime = (
-            _DevicePrefill
-            if _use_persistent_path(config, tokens, tp, sm_count)
-            else _GeneralPrefill
-        )
-        _windows[key] = runtime(group, tokens, config)
-    return _windows[key](inputs)
+    with torch.cuda.device(hidden.device):
+        if key not in _windows:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("warm up this shape before capture")
+            sm_count = torch.cuda.get_device_properties(
+                hidden.device
+            ).multi_processor_count
+            runtime = (
+                _DevicePrefill
+                if _use_persistent_path(config, tokens, tp, sm_count)
+                else _GeneralPrefill
+            )
+            _windows[key] = runtime(group, tokens, config)
+        return _windows[key](inputs)
 
 
 def clear_megapreattention_cache():
