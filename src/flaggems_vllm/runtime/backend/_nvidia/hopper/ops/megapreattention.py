@@ -15,10 +15,11 @@
 """TLE peer-to-peer tile-ready prefill, implemented entirely in this file.
 
 Owns registration, signaling, projection, postprocessing and runtime lifetime.
-Requires at least 128 SMs and complete M128 tiles. Every persistent grid
-must fit concurrently. No other scheme is imported.
+The optimized persistent grid requires at least 128 SMs and complete M128
+input tiles. Other head geometries use a general Triton implementation.
 """
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -88,6 +89,8 @@ def _prepare_rope(
     M: tl.constexpr,
     INITIAL: tl.constexpr,
     BM: tl.constexpr,
+    SECTION_H: tl.constexpr = 11,
+    SECTION_W: tl.constexpr = 10,
 ):
     pid = tl.program_id(0)
     if pid == 0:
@@ -95,7 +98,14 @@ def _prepare_rope(
         tl.store(queue, INITIAL)
     row = pid * BM + tl.arange(0, BM)
     f = tl.arange(0, 32)
-    axis = tl.where(f % 3 == 1, 1, tl.where((f % 3 == 2) & (f <= 30), 2, 0))
+    if SECTION_H == 11 and SECTION_W == 10:
+        axis = tl.where(f % 3 == 1, 1, tl.where((f % 3 == 2) & (f <= 30), 2, 0))
+    else:
+        axis = tl.where(
+            (f % 3 == 1) & (f < 3 * SECTION_H),
+            1,
+            tl.where((f % 3 == 2) & (f < 3 * SECTION_W), 2, 0),
+        )
     pos = tl.load(
         positions + axis[None, :] * POS_AXIS + row[:, None] * POS_TOKEN,
         row[:, None] < M,
@@ -153,14 +163,18 @@ def _rendezvous(
 
 
 class _MappedCommunicator:
-    def __init__(self, group, tokens, producers, hidden_size=2048, programs=128):
+    def __init__(
+        self, group, tokens, producers, hidden_size=2048, programs=128, rope_columns=32
+    ):
         from torch._C._distributed_c10d import _SymmetricMemory
 
         self.group = group
         self.rank = dist.get_rank(group)
         self.world = dist.get_world_size(group)
         self.count = tokens * hidden_size
-        self.cos = torch.empty((tokens, 32), device="cuda", dtype=torch.bfloat16)
+        self.cos = torch.empty(
+            (tokens, rope_columns), device="cuda", dtype=torch.bfloat16
+        )
         self.sin = torch.empty_like(self.cos)
         self.work_queue = torch.empty((), device="cuda", dtype=torch.int32)
         self.max_programs = programs
@@ -173,7 +187,7 @@ class _MappedCommunicator:
         self.flag_words = max(
             self.max_programs * self.world, self.handshake_words + self.ready_words
         )
-        data_bytes = self.count * 2
+        data_bytes = triton.cdiv(self.count * 2, 8) * 8
         size = data_bytes + self.flag_words * 8
         self.allocation = _SymmetricMemory.empty_strided_p2p(
             (size,),
@@ -255,6 +269,7 @@ def _store_head(
     CACHE_DIM,
     CACHE_BLOCK_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    EPS: tl.constexpr = 1.0e-6,
 ):
     row = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     token = row_start + row
@@ -293,7 +308,7 @@ def _store_head(
         head = pid_n // 2
         weight = tl.load(tl.where(is_key, knorm, qnorm) + cols).to(tl.float32)
         x = raw.to(tl.float32)
-        scale = tl.rsqrt(tl.sum(x * x, 1) / 256.0 + 1.0e-6)
+        scale = tl.rsqrt(tl.sum(x * x, 1) / 256.0 + EPS)
         normalized = (
             (x * scale[:, None] * (weight[None, :] + 1.0))
             .to(tl.bfloat16)
@@ -387,6 +402,7 @@ def _fused_projection(
     target,
     WORLD: tl.constexpr = 1,
     READY_GROUP: tl.constexpr = 1,
+    EPS: tl.constexpr = 1.0e-6,
 ):
     ROW_GROUP: tl.constexpr = min(4, (M // BM) & -(M // BM))
     num_n: tl.constexpr = 2 * (Q_HEADS + KV_HEADS)
@@ -608,6 +624,7 @@ def _fused_projection(
             CACHE_DIM,
             CACHE_BLOCK_SIZE,
             BM,
+            EPS=EPS,
         )
         if PREFETCH_COUNT == 0:
             if tile_id < BULK_END and tile_id + STRIDE < BULK_END:
@@ -658,6 +675,7 @@ def _persistent(
     PIPE_STAGES: tl.constexpr,
     PROGRAMS: tl.constexpr,
     DEDUP_PUBLISH: tl.constexpr,
+    EPS: tl.constexpr = 1.0e-6,
 ):
     first_peer: tl.constexpr = 1 if PIPE_STAGES == 3 else 0
     ROW_PARTS: tl.constexpr = (1 if WORLD == 2 else 2) if DEDUP_PUBLISH else COMM
@@ -789,6 +807,7 @@ def _persistent(
         (epoch + 1) * ROW_PARTS,
         WORLD,
         GROUP,
+        EPS=EPS,
     )
 
 
@@ -909,6 +928,8 @@ class _DevicePrefill:
             M=t,
             INITIAL=bulk,
             BM=128,
+            SECTION_H=c.mrope_section[1],
+            SECTION_W=c.mrope_section[2],
             num_warps=4,
         )
         kernel = _persistent[(policy.programs,)](
@@ -947,6 +968,7 @@ class _DevicePrefill:
             PIPE_STAGES=policy.pipeline_stages,
             PROGRAMS=policy.programs,
             DEDUP_PUBLISH=policy.ownership_enabled,
+            EPS=c.eps,
             num_warps=8,
         )
         self.resources = {
@@ -960,21 +982,301 @@ class _DevicePrefill:
         self.communication.close()
 
 
+@triton.jit
+def _gather_input(
+    source,
+    peers,
+    counters,
+    local,
+    rank,
+    M: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    WORLD: tl.constexpr,
+    COMM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    epoch = tl.atomic_add(counters + pid, 1, sem="relaxed").to(tl.uint64)
+    flags: tl.constexpr = triton.cdiv(M * HIDDEN, 4)
+    _rendezvous(local, peers, pid, rank, 2 * epoch + 1, flags, WORLD)
+    count: tl.constexpr = M // WORLD * HIDDEN
+    for start in range(pid * BLOCK, count, COMM * BLOCK):
+        index = start + tl.arange(0, BLOCK)
+        values = tl.load(source + index, index < count, other=0)
+        for destination in tl.static_range(WORLD):
+            remote = tl.load(peers + destination).to(tl.pointer_type(tl.bfloat16))
+            tl.store(remote + rank * count + index, values, index < count)
+    # Every writer publishes its payload before its producer's completion signal.
+    tl.inline_asm_elementwise(
+        "fence.acq_rel.sys; mov.u32 $0,0;",
+        "=r",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    tl.debug_barrier()
+    _rendezvous(local, peers, pid, rank, 2 * epoch + 2, flags, WORLD)
+
+
+@triton.jit
+def _general_projection(
+    hidden,
+    weight,
+    output,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    row = tl.program_id(0) * BM + tl.arange(0, BM)
+    column = tl.program_id(1) * BN + tl.arange(0, BN)
+    reduction = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for start in range(tl.cdiv(K, BK)):
+        k = start * BK + reduction
+        a = tl.load(
+            hidden + row[:, None] * K + k[None, :],
+            (row < M)[:, None] & (k < K)[None, :],
+            other=0,
+        )
+        b = tl.load(
+            weight + column[None, :] * K + k[:, None],
+            (column < N)[None, :] & (k < K)[:, None],
+            other=0,
+        )
+        acc = tl.dot(a, b, acc)
+    tl.store(
+        output + row[:, None] * N + column[None, :],
+        acc.to(tl.bfloat16),
+        (row < M)[:, None] & (column < N)[None, :],
+    )
+
+
+@triton.jit
+def _general_store(
+    projection,
+    query,
+    key,
+    value,
+    gate,
+    qnorm,
+    knorm,
+    positions,
+    rope,
+    cache,
+    slots,
+    POS_AXIS,
+    POS_TOKEN,
+    ROPE_STRIDE,
+    SLOT_STRIDE,
+    CACHE_BLOCK,
+    CACHE_HEAD,
+    CACHE_TOKEN,
+    CACHE_DIM,
+    Q_HEADS: tl.constexpr,
+    KV_HEADS: tl.constexpr,
+    D: tl.constexpr,
+    R: tl.constexpr,
+    SECTION_H: tl.constexpr,
+    SECTION_W: tl.constexpr,
+    EPS: tl.constexpr,
+    CACHE_BLOCK_SIZE: tl.constexpr,
+    BD: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    column = tl.arange(0, BD)
+    packed: tl.constexpr = 2 * (Q_HEADS + KV_HEADS) * D
+    is_query = head < Q_HEADS
+    local_head = tl.where(is_query, head, (head - Q_HEADS) % KV_HEADS)
+    source_column = tl.where(
+        is_query, 2 * head * D, 2 * Q_HEADS * D + (head - Q_HEADS) * D
+    )
+    raw = tl.load(
+        projection + token * packed + source_column + column, column < D, other=0
+    )
+    if head < Q_HEADS + KV_HEADS:
+        weights = tl.load(
+            tl.where(is_query, qnorm, knorm) + column, column < D, other=0
+        ).to(tl.float32)
+        x = raw.to(tl.float32)
+        scale = tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
+        normalized = (x * scale * (weights + 1.0)).to(tl.bfloat16).to(tl.float32)
+        result = normalized
+        if R > 0:
+            half: tl.constexpr = R // 2
+            frequency = column % half
+            axis = tl.where(
+                (frequency % 3 == 1) & (frequency < 3 * SECTION_H),
+                1,
+                tl.where((frequency % 3 == 2) & (frequency < 3 * SECTION_W), 2, 0),
+            )
+            position = tl.load(positions + axis * POS_AXIS + token * POS_TOKEN)
+            co = tl.load(
+                rope + position * ROPE_STRIDE + frequency, column < R, other=1
+            ).to(tl.float32)
+            si = tl.load(
+                rope + position * ROPE_STRIDE + half + frequency, column < R, other=0
+            ).to(tl.float32)
+            partner = tl.where(column < half, column + half, column - half)
+            partner = tl.where(column < R, partner, 0)
+            other = tl.gather(normalized, partner, 0)
+            rotated = normalized * co + tl.where(column < half, -other, other) * si
+            result = tl.where(column < R, rotated, normalized)
+        destination = tl.where(is_query, query, key)
+        stride = tl.where(is_query, Q_HEADS, KV_HEADS) * D
+        tl.store(
+            destination + token * stride + local_head * D + column,
+            result.to(tl.bfloat16),
+            column < D,
+        )
+        if head < Q_HEADS:
+            raw_gate = tl.load(
+                projection + token * packed + (2 * head + 1) * D + column,
+                column < D,
+                other=0,
+            )
+            tl.store(
+                gate + token * Q_HEADS * D + head * D + column, raw_gate, column < D
+            )
+        else:
+            slot = tl.load(slots + token * SLOT_STRIDE).to(tl.int64)
+            target = (
+                cache
+                + (slot // CACHE_BLOCK_SIZE) * CACHE_BLOCK
+                + local_head * CACHE_HEAD
+            )
+            target += (slot % CACHE_BLOCK_SIZE) * CACHE_TOKEN + column * CACHE_DIM
+            tl.store(target, result.to(tl.bfloat16), (column < D) & (slot >= 0))
+    else:
+        tl.store(
+            value + token * KV_HEADS * D + local_head * D + column, raw, column < D
+        )
+        slot = tl.load(slots + token * SLOT_STRIDE).to(tl.int64)
+        target = (
+            cache + (slot // CACHE_BLOCK_SIZE) * CACHE_BLOCK + local_head * CACHE_HEAD
+        )
+        target += (slot % CACHE_BLOCK_SIZE) * CACHE_TOKEN + (D + column) * CACHE_DIM
+        tl.store(target, raw, (column < D) & (slot >= 0))
+
+
+class _GeneralPrefill:
+    """Correctness-oriented path for head geometry outside the persistent tile."""
+
+    def __init__(self, group, tokens, config):
+        self.tokens = tokens
+        self.config = config
+        self.producers = min(
+            7,
+            torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count,
+        )
+        self.communication = _MappedCommunicator(
+            group,
+            tokens,
+            self.producers,
+            config.hidden_size,
+            programs=self.producers,
+            rope_columns=0,
+        )
+
+    def __call__(self, x):
+        c, t, rt = x.config, self.tokens, self.communication
+        q = torch.empty((t, c.q_size), device=x.hidden.device, dtype=x.hidden.dtype)
+        k = torch.empty((t, c.kv_size), device=x.hidden.device, dtype=x.hidden.dtype)
+        v, gate = torch.empty_like(k), torch.empty_like(q)
+        projection = torch.empty(
+            (t, c.packed_size), device=x.hidden.device, dtype=x.hidden.dtype
+        )
+        _gather_input[(self.producers,)](
+            x.hidden,
+            rt.peers,
+            rt.counters,
+            rt.buffer,
+            rt.rank,
+            M=t,
+            HIDDEN=c.hidden_size,
+            WORLD=rt.world,
+            COMM=self.producers,
+            BLOCK=256,
+            num_warps=4,
+        )
+        kernel = _general_projection[
+            (triton.cdiv(t, 32), triton.cdiv(c.packed_size, 64))
+        ](
+            rt.buffer,
+            x.weight,
+            projection,
+            M=t,
+            N=c.packed_size,
+            K=c.hidden_size,
+            BM=32,
+            BN=64,
+            BK=32,
+            num_warps=4,
+        )
+        _general_store[(t, c.num_q_heads + 2 * c.num_kv_heads)](
+            projection,
+            q,
+            k,
+            v,
+            gate,
+            x.q_norm,
+            x.k_norm,
+            x.positions,
+            x.rope,
+            x.cache,
+            x.slots,
+            *x.positions.stride(),
+            x.rope.stride(0),
+            x.slots.stride(0),
+            *x.cache.stride(),
+            Q_HEADS=c.num_q_heads,
+            KV_HEADS=c.num_kv_heads,
+            D=c.head_dim,
+            R=c.rotary_dim,
+            SECTION_H=c.mrope_section[1],
+            SECTION_W=c.mrope_section[2],
+            EPS=c.eps,
+            CACHE_BLOCK_SIZE=x.cache.shape[2],
+            BD=triton.next_power_of_2(c.head_dim),
+            num_warps=4,
+        )
+        self.resources = dict(
+            path="general",
+            registers=kernel.n_regs,
+            spills=kernel.n_spills,
+            shared_bytes=kernel.metadata.shared,
+        )
+        return q, k, v, gate.view(t, c.num_q_heads, c.head_dim)
+
+    def close(self):
+        self.communication.close()
+
+
+def _use_persistent_path(config, tokens, tp, sm_count):
+    return (
+        tle is not None
+        and config.head_dim == 256
+        and config.rotary_dim == 64
+        and config.hidden_size >= 256
+        and config.hidden_size % 64 == 0
+        and tokens >= 1024
+        and tokens % (tp * 128) == 0
+        and sm_count >= 128
+    )
+
+
 def _validate_input(inputs):
     if inputs.positions.ndim != 2 or inputs.positions.shape[0] != 3:
         raise NotImplementedError("positions must have three axes")
     if inputs.hidden.device.type != "cuda":
         raise NotImplementedError("only CUDA tensors are supported")
     c, t, tp = inputs.config, inputs.positions.shape[1], inputs.group.size()
-    if (c.head_dim, c.rotary_dim, c.mrope_section, c.eps) != (
-        256,
-        64,
-        (11, 11, 10),
-        1e-6,
-    ):
-        raise NotImplementedError(
-            "unsupported megapreattention norm/RoPE configuration"
-        )
     if (
         inputs.hidden.shape != (t // tp, c.hidden_size)
         or not inputs.hidden.is_contiguous()
@@ -991,17 +1293,17 @@ def _validate_input(inputs):
         inputs.cache.ndim != 4
         or inputs.slots.shape != (t,)
         or inputs.cache.shape[1] != c.num_kv_heads
-        or inputs.cache.shape[3] != 512
+        or inputs.cache.shape[3] != 2 * c.head_dim
     ):
         raise NotImplementedError("unsupported slots/cache metadata")
     if any(
-        w.shape != (256,) or not w.is_contiguous()
+        w.shape != (c.head_dim,) or not w.is_contiguous()
         for w in (inputs.q_norm, inputs.k_norm)
     ):
-        raise NotImplementedError("norm weights must be contiguous length256")
+        raise NotImplementedError("norm weights must be contiguous length head_dim")
     if (
         inputs.rope.ndim != 2
-        or inputs.rope.shape[1] != 64
+        or inputs.rope.shape[1] != c.rotary_dim
         or inputs.rope.stride(1) != 1
     ):
         raise NotImplementedError("unsupported RoPE cache shape/stride")
@@ -1030,12 +1332,6 @@ def _validate_input(inputs):
         raise NotImplementedError("positions and slots must be int64")
     if torch.cuda.get_device_capability(inputs.hidden.device)[0] != 9:
         raise NotImplementedError("only Hopper SM90 is supported")
-    _select_device_policy(
-        tp,
-        t,
-        torch.cuda.get_device_properties(inputs.hidden.device).multi_processor_count,
-        c.hidden_size,
-    )
 
 
 _windows = {}
@@ -1061,15 +1357,16 @@ def megapreattention(
 ):
     """AllGather, gated QKV projection, Gemma RMSNorm/MRoPE and KV-cache update.
 
-    Head counts are global (before tensor parallel sharding). Hidden width
-    must be a multiple of 64 and at least 256. Q heads must divide evenly
-    across TP2/4/8; KV heads are evenly sharded or replicated across ranks.
-    Model sizes are not restricted to a named architecture. Performance has
-    only been measured for the documented benchmark shapes.
+    Head counts are global (before TP sharding). Q heads divide evenly across
+    TP2/4/8; KV heads shard or replicate evenly. BF16 inference on SM90 only.
+    Positive hidden/head widths are accepted. rotary_dim is even, in [0,D],
+    and the three nonnegative interleaved MRoPE sections sum to rotary_dim/2.
+    eps is finite and nonnegative; positions has three axes.
 
-    The kernel requires D=256, rotary_dim=64, sections=(11,11,10), eps=1e-6,
-    BF16 and SM90 GPUs with at least 128 SMs. These are implementation
-    constraints, independent of the model's hidden width or head counts.
+    D256/R64 uses the measured persistent path when H has complete K64 tiles
+    (H>=256), tokens have complete M128 tiles per rank (T>=1024), and the GPU
+    has at least128SMs. Other legal dimensions use a general Triton path;
+    performance is not guaranteed outside the benchmark shapes.
 
     hidden is contiguous [T/TP, H]. weight is contiguous
     [2 * (local_q_heads + local_kv_heads) * D, H], packed as interleaved Q/gate
@@ -1094,15 +1391,14 @@ def megapreattention(
     The validated offline policy is kept in _select_device_policy.
     """
     if hidden.ndim != 2:
-        raise NotImplementedError("megapreattention requires rank-local [T/TP,H] hidden")
+        raise NotImplementedError(
+            "megapreattention requires rank-local [T/TP,H] hidden"
+        )
     tp = group.size()
     if tp not in (2, 4, 8):
         raise NotImplementedError("megapreattention requires TP2/TP4/TP8")
-    # Complete K64 tiles are required by the descriptors and four-stage fallback.
-    if hidden.shape[1] < 256 or hidden.shape[1] % 64:
-        raise NotImplementedError(
-            "megapreattention requires H>=256 and complete 64-column hidden tiles"
-        )
+    if hidden.shape[1] <= 0:
+        raise NotImplementedError("megapreattention requires a positive hidden width")
     if num_heads <= 0 or num_heads % tp:
         raise NotImplementedError(
             "megapreattention requires a positive Q head count divisible by TP"
@@ -1113,23 +1409,23 @@ def megapreattention(
         raise NotImplementedError(
             "megapreattention requires evenly sharded or replicated KV heads"
         )
-    if (head_dim, rotary_dim, tuple(mrope_section), eps) != (
-        256,
-        64,
-        (11, 11, 10),
-        1e-6,
+    if head_dim <= 0 or rotary_dim < 0 or rotary_dim > head_dim or rotary_dim % 2:
+        raise ValueError("rotary_dim must be even and between zero and head_dim")
+    sections = tuple(mrope_section)
+    if (
+        len(sections) != 3
+        or any(not isinstance(part, int) or part < 0 for part in sections)
+        or sum(sections) != rotary_dim // 2
     ):
-        raise NotImplementedError(
-            "megapreattention requires D256/R64, mrope_section=(11,11,10), eps=1e-6"
-        )
-    if tle is None:
-        raise NotImplementedError("megapreattention requires FlagTree/TLE >= 3.6")
+        raise ValueError("three nonnegative MRoPE sections must sum to rotary_dim/2")
+    if not math.isfinite(eps) or eps < 0:
+        raise ValueError("eps must be finite and nonnegative")
     config = _Config(
         num_heads // tp,
         max(1, num_kv_heads // tp),
         head_dim,
         rotary_dim,
-        tuple(mrope_section),
+        sections,
         eps,
         hidden.shape[1],
     )
@@ -1147,11 +1443,21 @@ def megapreattention(
     )
     _validate_input(inputs)
     tokens = positions.shape[1]
+    if tokens <= 0 or tokens % tp:
+        raise NotImplementedError(
+            "tokens must be positive and evenly sharded across TP"
+        )
     key = (id(group), tokens, hidden.device, config)
     if key not in _windows:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("warm up this shape before capture")
-        _windows[key] = _DevicePrefill(group, tokens, config)
+        sm_count = torch.cuda.get_device_properties(hidden.device).multi_processor_count
+        runtime = (
+            _DevicePrefill
+            if _use_persistent_path(config, tokens, tp, sm_count)
+            else _GeneralPrefill
+        )
+        _windows[key] = runtime(group, tokens, config)
     return _windows[key](inputs)
 
 

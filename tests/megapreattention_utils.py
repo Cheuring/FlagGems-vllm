@@ -87,7 +87,7 @@ class Output:
         return self.query, self.key, self.value, self.gate
 
 
-def load_fixture(path=None, model_dims=(2048, 16, 2)):
+def load_fixture(path=None, model_dims=(2048, 16, 2), head_dim=256):
     hidden_size, q_heads, kv_heads = model_dims
     if path is not None:
         fixture = torch.load(path, map_location="cpu", weights_only=True)
@@ -97,11 +97,11 @@ def load_fixture(path=None, model_dims=(2048, 16, 2)):
             ).hexdigest()
             assert digest == fixture["metadata"]["weight_sha256"][name]
         expected = {
-            "q_proj.weight": (2 * q_heads * 256, hidden_size),
-            "k_proj.weight": (kv_heads * 256, hidden_size),
-            "v_proj.weight": (kv_heads * 256, hidden_size),
-            "q_norm.weight": (256,),
-            "k_norm.weight": (256,),
+            "q_proj.weight": (2 * q_heads * head_dim, hidden_size),
+            "k_proj.weight": (kv_heads * head_dim, hidden_size),
+            "v_proj.weight": (kv_heads * head_dim, hidden_size),
+            "q_norm.weight": (head_dim,),
+            "k_norm.weight": (head_dim,),
         }
         for name, shape in expected.items():
             if tuple(fixture["weights"][name].shape) != shape:
@@ -112,20 +112,27 @@ def load_fixture(path=None, model_dims=(2048, 16, 2)):
     generator = torch.Generator().manual_seed(20261010)
     weights = {
         "q_proj.weight": torch.randn(
-            2 * q_heads * 256, hidden_size, generator=generator, dtype=torch.bfloat16
+            2 * q_heads * head_dim,
+            hidden_size,
+            generator=generator,
+            dtype=torch.bfloat16,
         )
         * 0.02,
         "k_proj.weight": torch.randn(
-            kv_heads * 256, hidden_size, generator=generator, dtype=torch.bfloat16
+            kv_heads * head_dim, hidden_size, generator=generator, dtype=torch.bfloat16
         )
         * 0.02,
         "v_proj.weight": torch.randn(
-            kv_heads * 256, hidden_size, generator=generator, dtype=torch.bfloat16
+            kv_heads * head_dim, hidden_size, generator=generator, dtype=torch.bfloat16
         )
         * 0.02,
-        "q_norm.weight": torch.randn(256, generator=generator, dtype=torch.bfloat16)
+        "q_norm.weight": torch.randn(
+            head_dim, generator=generator, dtype=torch.bfloat16
+        )
         * 0.1,
-        "k_norm.weight": torch.randn(256, generator=generator, dtype=torch.bfloat16)
+        "k_norm.weight": torch.randn(
+            head_dim, generator=generator, dtype=torch.bfloat16
+        )
         * 0.1,
     }
     return {
@@ -161,13 +168,33 @@ def run_candidate(inputs):
     )
 
 
-def make_inputs(tokens, tp, rank, fixture, *, edge=False, model_dims=(2048, 16, 2)):
+def make_inputs(
+    tokens,
+    tp,
+    rank,
+    fixture,
+    *,
+    edge=False,
+    model_dims=(2048, 16, 2),
+    head_dim=256,
+    rotary_dim=64,
+    mrope_section=(11, 11, 10),
+    eps=1e-6,
+):
     from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 
     hidden_size, q_heads, kv_heads = model_dims
-    config = Config(q_heads // tp, max(1, kv_heads // tp), global_kv_heads=kv_heads)
+    config = Config(
+        q_heads // tp,
+        max(1, kv_heads // tp),
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        mrope_section=tuple(mrope_section),
+        eps=eps,
+        global_kv_heads=kv_heads,
+    )
     weights = fixture["weights"]
-    qwidth = q_heads * 256 * 2 // tp
+    qwidth = q_heads * head_dim * 2 // tp
     kv_rank = rank // max(1, tp // kv_heads)
     kv_start = kv_rank * config.kv_size
     local = torch.cat(
@@ -205,26 +232,26 @@ def make_inputs(tokens, tp, rank, fixture, *, edge=False, model_dims=(2048, 16, 
     count = tokens * 2 + 128 if edge else tokens + 128
     blocks = (count + 127) // 128
     cache = torch.full(
-        (blocks, config.num_kv_heads, 128, 512),
+        (blocks, config.num_kv_heads, 128, 2 * head_dim),
         0.375,
         device="cuda",
         dtype=torch.bfloat16,
     )
     if edge:
         cache = torch.full(
-            (128, config.num_kv_heads, blocks, 512),
+            (128, config.num_kv_heads, blocks, 2 * head_dim),
             0.375,
             device="cuda",
             dtype=torch.bfloat16,
         ).permute(2, 1, 0, 3)
     rope = MRotaryEmbedding(
-        256,
-        64,
+        head_dim,
+        rotary_dim,
         262144,
         1.0e7,
         True,
         torch.bfloat16,
-        mrope_section=[11, 11, 10],
+        mrope_section=list(mrope_section),
         mrope_interleaved=True,
     )
     rope.cos_sin_cache = rope.cos_sin_cache.to("cuda")
@@ -257,13 +284,23 @@ class NativeWindow:
         from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
         symm.enable_symm_mem_for_group(inputs.group.group_name)
-        qnorm = SimpleNamespace(weight=inputs.q_norm, variance_epsilon=1e-6)
-        knorm = SimpleNamespace(weight=inputs.k_norm, variance_epsilon=1e-6)
+        qnorm = SimpleNamespace(
+            weight=inputs.q_norm, variance_epsilon=inputs.config.eps
+        )
+        knorm = SimpleNamespace(
+            weight=inputs.k_norm, variance_epsilon=inputs.config.eps
+        )
         qnorm_call = lambda x: GemmaRMSNorm.forward_native(qnorm, x)
         knorm_call = lambda x: GemmaRMSNorm.forward_native(knorm, x)
         # The projection method reads .weight even for its fused fast path.
-        qnorm_call.weight, qnorm_call.variance_epsilon = inputs.q_norm, 1e-6
-        knorm_call.weight, knorm_call.variance_epsilon = inputs.k_norm, 1e-6
+        qnorm_call.weight, qnorm_call.variance_epsilon = (
+            inputs.q_norm,
+            inputs.config.eps,
+        )
+        knorm_call.weight, knorm_call.variance_epsilon = (
+            inputs.k_norm,
+            inputs.config.eps,
+        )
         self.context = SimpleNamespace(
             use_fused_qk_norm_rope_gate=not edge,
             attn_output_gate=True,
@@ -271,7 +308,7 @@ class NativeWindow:
             kv_size=inputs.config.kv_size,
             num_heads=inputs.config.num_q_heads,
             num_kv_heads=inputs.config.num_kv_heads,
-            head_dim=256,
+            head_dim=inputs.config.head_dim,
             q_norm=qnorm_call,
             k_norm=knorm_call,
             rotary_emb=rope,
@@ -296,10 +333,12 @@ class NativeWindow:
 
     def _postprocess(self, qkv, positions, cache, slots):
         q, k, v, gate = self.method(self.context, qkv, positions)
-        key_cache, value_cache = cache.transpose(1, 2).split(256, dim=-1)
+        key_cache, value_cache = cache.transpose(1, 2).split(
+            self.context.head_dim, dim=-1
+        )
         self.cache_op(
-            k.view(-1, self.context.num_kv_heads, 256),
-            v.view(-1, self.context.num_kv_heads, 256),
+            k.view(-1, self.context.num_kv_heads, self.context.head_dim),
+            v.view(-1, self.context.num_kv_heads, self.context.head_dim),
             key_cache,
             value_cache,
             slots,
@@ -307,7 +346,12 @@ class NativeWindow:
             self.scale,
             self.scale,
         )
-        return q, k, v, gate.view(q.shape[0], self.context.num_heads, 256)
+        return (
+            q,
+            k,
+            v,
+            gate.view(q.shape[0], self.context.num_heads, self.context.head_dim),
+        )
 
     def __call__(self, inputs):
         gathered, products = torch.ops.symm_mem.fused_all_gather_matmul.default(
@@ -326,13 +370,14 @@ def independent_reference(inputs):
     dist.all_gather_into_tensor(hidden, inputs.hidden, group=inputs.group)
     qkv = hidden @ inputs.weight.t()
     qgate, key, value = qkv.split((2 * c.q_size, c.kv_size, c.kv_size), dim=-1)
-    query, gate = qgate.view(t, c.num_q_heads, 512).chunk(2, dim=-1)
-    frequency = torch.arange(32, device="cuda")
+    query, gate = qgate.view(t, c.num_q_heads, 2 * c.head_dim).chunk(2, dim=-1)
+    frequency = torch.arange(c.rotary_dim // 2, device="cuda")
     axis = torch.zeros_like(frequency)
-    axis[1:33:3], axis[2:30:3] = 1, 2
+    axis[1 : 3 * c.mrope_section[1] : 3] = 1
+    axis[2 : 3 * c.mrope_section[2] : 3] = 2
     position = inputs.positions[axis].t()
     cos = inputs.rope[position, frequency].float().unsqueeze(1)
-    sin = inputs.rope[position, frequency + 32].float().unsqueeze(1)
+    sin = inputs.rope[position, frequency + c.rotary_dim // 2].float().unsqueeze(1)
 
     def norm_rope(x, weight):
         x = x.float()
@@ -345,19 +390,23 @@ def independent_reference(inputs):
             .to(torch.bfloat16)
             .float()
         )
-        first, second = normalized[..., :64].chunk(2, dim=-1)
+        first, second = normalized[..., : c.rotary_dim].chunk(2, dim=-1)
         rotated = torch.cat(
             (first * cos - second * sin, second * cos + first * sin), dim=-1
         )
-        return torch.cat((rotated, normalized[..., 64:]), dim=-1).to(torch.bfloat16)
+        return torch.cat((rotated, normalized[..., c.rotary_dim :]), dim=-1).to(
+            torch.bfloat16
+        )
 
     query = norm_rope(query, inputs.q_norm).reshape(t, c.q_size)
-    key = norm_rope(key.view(t, c.num_kv_heads, 256), inputs.k_norm)
+    key = norm_rope(key.view(t, c.num_kv_heads, c.head_dim), inputs.k_norm)
     valid = inputs.slots >= 0
     slots = inputs.slots[valid]
     block, offset = slots // inputs.cache.shape[2], slots % inputs.cache.shape[2]
-    inputs.cache[block, :, offset, :256] = key[valid]
-    inputs.cache[block, :, offset, 256:] = value.view(t, c.num_kv_heads, 256)[valid]
+    inputs.cache[block, :, offset, : c.head_dim] = key[valid]
+    inputs.cache[block, :, offset, c.head_dim :] = value.view(
+        t, c.num_kv_heads, c.head_dim
+    )[valid]
     return Output(query, key.reshape(t, c.kv_size), value, gate)
 
 
@@ -408,6 +457,7 @@ def _worker(
     directory,
     fixture_path,
     model_dims,
+    kernel_config,
 ):
     import torch
     import torch.distributed as dist
@@ -428,9 +478,9 @@ def _worker(
 
     native_context = set_current_vllm_config(VllmConfig())
     native_context.__enter__()
-    fixture = load_fixture(fixture_path, model_dims)
+    fixture = load_fixture(fixture_path, model_dims, kernel_config["head_dim"])
     source, rope = make_inputs(
-        tokens, tp, rank, fixture, edge=edge, model_dims=model_dims
+        tokens, tp, rank, fixture, edge=edge, model_dims=model_dims, **kernel_config
     )
     from flaggems_vllm.runtime.backend._nvidia.hopper.ops import (
         megapreattention as impl,
@@ -532,12 +582,6 @@ def _worker(
                 hidden=value.hidden[:0],
                 positions=value.positions[:, :0],
                 slots=value.slots[:0],
-            ),
-            "tail": replace(
-                value,
-                hidden=value.hidden[:-1],
-                positions=value.positions[:, :-tp],
-                slots=value.slots[:-tp],
             ),
         }
         unsupported[name] = {}
@@ -654,6 +698,10 @@ def run_distributed(
     check_only=False,
     fixture_path=None,
     model_dims=(2048, 16, 2),
+    head_dim=256,
+    rotary_dim=64,
+    mrope_section=(11, 11, 10),
+    eps=1e-6,
 ):
     import torch.multiprocessing as mp
 
@@ -663,6 +711,12 @@ def run_distributed(
     _, q_heads, kv_heads = model_dims
     if q_heads % tp or (kv_heads % tp if kv_heads >= tp else tp % kv_heads):
         raise ValueError("head counts must shard or replicate evenly across TP")
+    kernel_config = dict(
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        mrope_section=tuple(mrope_section),
+        eps=eps,
+    )
     reports = []
     for round_index in range(rounds):
         with tempfile.TemporaryDirectory(prefix="megapreattention-") as directory:
@@ -679,6 +733,7 @@ def run_distributed(
                     directory,
                     fixture_path,
                     model_dims,
+                    kernel_config,
                 ),
                 nprocs=tp,
                 join=False,
@@ -727,6 +782,7 @@ def run_distributed(
             )
     result = {
         "model_dims": model_dims,
+        "kernel_config": kernel_config,
         "tp": tp,
         "tokens": tokens,
         "mode": mode,

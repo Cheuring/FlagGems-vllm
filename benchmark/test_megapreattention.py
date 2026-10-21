@@ -54,8 +54,6 @@ class MegaPreAttentionBenchmark(base.Benchmark):
     def get_latency(
         self, op, tokens, tp, hidden, q_heads, kv_heads, head_dim, rotary_dim
     ):
-        if (head_dim, rotary_dim) != (256, 64):
-            raise NotImplementedError("megapreattention requires D256/R64")
         if not torch.cuda.is_available() or torch.cuda.device_count() < tp:
             pytest.skip(f"requires {tp} CUDA GPUs")
         if any(
@@ -80,7 +78,18 @@ class MegaPreAttentionBenchmark(base.Benchmark):
             if any(a == "--iter" or a.startswith("--iter=") for a in sys.argv)
             else 100
         )
-        key = (tokens, tp, hidden, q_heads, kv_heads, mode, warmup, iterations)
+        key = (
+            tokens,
+            tp,
+            hidden,
+            q_heads,
+            kv_heads,
+            head_dim,
+            rotary_dim,
+            mode,
+            warmup,
+            iterations,
+        )
         if key not in self.paired_results:
             self.paired_results[key] = run_distributed(
                 tp,
@@ -90,6 +99,17 @@ class MegaPreAttentionBenchmark(base.Benchmark):
                 iterations=iterations,
                 rounds=5,
                 model_dims=(hidden, q_heads, kv_heads),
+                head_dim=head_dim,
+                rotary_dim=rotary_dim,
+                mrope_section=(
+                    (11, 11, 10)
+                    if rotary_dim == 64
+                    else (
+                        rotary_dim // 6,
+                        rotary_dim // 6,
+                        rotary_dim // 2 - 2 * (rotary_dim // 6),
+                    )
+                ),
             )
         name = "native" if op == self.native else "megapreattention"
         return self.paired_results[key]["summary"][name]["latency_ms"]

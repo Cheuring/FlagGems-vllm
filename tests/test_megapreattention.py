@@ -98,13 +98,13 @@ def test_megapreattention_metadata_bounds(words, programs):
 @pytest.mark.parametrize(
     "dimension,value",
     [
-        ("hidden_size", 257),
+        ("hidden_size", 0),
         ("num_heads", 3),
         ("num_kv_heads", 3),
-        ("head_dim", 128),
-        ("rotary_dim", 128),
-        ("mrope_section", (16, 8, 8)),
-        ("eps", 1e-5),
+        ("head_dim", 0),
+        ("rotary_dim", 65),
+        ("mrope_section", (-1, 11, 22)),
+        ("eps", -1e-5),
         ("tp", 1),
     ],
 )
@@ -129,7 +129,7 @@ def test_megapreattention_rejects_incompatible_metadata_before_collectives(
         dims[dimension] = value
     # CPU metadata is sufficient: do not initialize ranks or allocate on CUDA.
     hidden, dummy = torch.empty(0, hidden_size), torch.empty(0)
-    with pytest.raises(NotImplementedError, match="megapreattention"):
+    with pytest.raises((ValueError, NotImplementedError)):
         megapreattention(
             hidden,
             dummy,
@@ -142,3 +142,42 @@ def test_megapreattention_rejects_incompatible_metadata_before_collectives(
             SimpleNamespace(size=lambda: tp),
             **dims,
         )
+
+
+GENERAL_CASES = [
+    (2, 1024, (512, 8, 2), 128, 64, (16, 8, 8), 1e-5),
+    (4, 1024, (768, 16, 8), 96, 32, (6, 5, 5), 1e-5),
+]
+if not cfg.QUICK_MODE:
+    GENERAL_CASES += [
+        (2, 258, (320, 8, 2), 192, 96, (16, 16, 16), 1e-6),
+        (2, 256, (257, 8, 2), 64, 0, (0, 0, 0), 1e-5),
+        (2, 1024, (512, 8, 2), 512, 128, (22, 21, 21), 1e-6),
+        (2, 1024, (2048, 16, 2), 256, 64, (16, 8, 8), 1e-5),
+        (4, 1024, (2048, 16, 2), 256, 64, (8, 12, 12), 1e-4),
+    ]
+
+
+@pytest.mark.parametrize(
+    "tp,tokens,model_dims,head_dim,rotary_dim,sections,eps", GENERAL_CASES
+)
+def test_megapreattention_general_geometry(
+    tp, tokens, model_dims, head_dim, rotary_dim, sections, eps
+):
+    require_hopper(tp)
+    result = run_distributed(
+        tp,
+        tokens,
+        "cudagraph",
+        warmup=3,
+        rounds=1,
+        edge=True,
+        check_only=True,
+        model_dims=model_dims,
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        mrope_section=sections,
+        eps=eps,
+    )
+    assert result["correctness_passed"]
+    assert result["measurement_jit_free"]
