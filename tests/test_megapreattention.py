@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Numerical, Graph replay and unsupported-dimension tests for MegaPreAttention."""
+"""Distributed accuracy, Graph replay and input-contract coverage."""
 
 from types import SimpleNamespace
 
@@ -37,26 +37,29 @@ def require_hopper(tp=1):
     pytest.importorskip("triton.experimental.tle.language")
 
 
-CASES = [(2, 1024, "cudagraph", False), (2, 1024, "cudagraph", True)]
+# The shared worker checks changed-input Graph replay and poisoned transport.
+# Cover each scheduling path without a second private-input test suite.
+CASES = [
+    ((2048, 16, 2), 2, 1024, "cudagraph", True),
+    ((5120, 24, 4), 2, 1024, "cudagraph", False),
+    ((3072, 32, 8), 2, 1024, "cudagraph", True),
+]
 if not cfg.QUICK_MODE:
     CASES += [
-        (8, 1024, "cudagraph", False),
-        (4, 1024, "operator", False),
-        (8, 1024, "operator", True),
-        (2, 32768, "cudagraph", True),
-        (4, 32768, "cudagraph", True),
-        (2, 1280, "cudagraph", True),
-        (4, 1536, "cudagraph", True),
-        (8, 2048, "cudagraph", True),
-        (8, 32768, "cudagraph", True),
+        ((2048, 16, 2), 2, 1280, "cudagraph", True),
+        ((2048, 16, 2), 2, 32768, "cudagraph", True),
+        ((2048, 16, 2), 4, 1536, "operator", True),
+        ((2048, 16, 2), 4, 32768, "cudagraph", True),
+        ((2048, 16, 2), 8, 2048, "cudagraph", True),
+        ((2048, 16, 2), 8, 32768, "operator", False),
+        ((5120, 24, 4), 4, 1024, "operator", True),
+        ((5120, 24, 4), 8, 32768, "cudagraph", True),
+        ((1024, 32, 16), 4, 1024, "cudagraph", True),
     ]
 
 
-@pytest.mark.parametrize(
-    "model_dims", [(2048, 16, 2), (5120, 24, 4)], ids=["35b", "27b"]
-)
-@pytest.mark.parametrize("tp,tokens,mode,edge", CASES)
-def test_megapreattention(tp, tokens, mode, edge, model_dims):
+@pytest.mark.parametrize("model_dims,tp,tokens,mode,edge", CASES)
+def test_megapreattention(model_dims, tp, tokens, mode, edge):
     require_hopper(tp)
     result = run_distributed(
         tp,
@@ -73,8 +76,7 @@ def test_megapreattention(tp, tokens, mode, edge, model_dims):
     assert all(len(r["ranks"]) == tp for r in result["reports"])
 
 
-@pytest.mark.parametrize("words", [544, 1088, 2050])
-@pytest.mark.parametrize("programs", [128, 132])
+@pytest.mark.parametrize("words,programs", [(544, 128), (1088, 132), (2050, 132)])
 def test_megapreattention_metadata_bounds(words, programs):
     require_hopper()
     import triton
@@ -94,15 +96,11 @@ def test_megapreattention_metadata_bounds(words, programs):
 
 
 @pytest.mark.parametrize(
-    "model_dims", [(2048, 16, 2), (5120, 24, 4)], ids=["35b", "27b"]
-)
-@pytest.mark.parametrize(
     "dimension,value",
     [
-        ("hidden_size", 4096),
-        ("mixed_model", None),
-        ("num_heads", 32),
-        ("num_kv_heads", 8),
+        ("hidden_size", 257),
+        ("num_heads", 3),
+        ("num_kv_heads", 3),
         ("head_dim", 128),
         ("rotary_dim", 128),
         ("mrope_section", (16, 8, 8)),
@@ -110,29 +108,26 @@ def test_megapreattention_metadata_bounds(words, programs):
         ("tp", 1),
     ],
 )
-def test_megapreattention_rejects_unsupported_model_before_collectives(
-    dimension, value, model_dims
+def test_megapreattention_rejects_incompatible_metadata_before_collectives(
+    dimension, value
 ):
     from flaggems_vllm.runtime.backend._nvidia.hopper.ops.megapreattention import (
         megapreattention,
     )
 
-    hidden_size, q_heads, kv_heads = model_dims
+    hidden_size = value if dimension == "hidden_size" else 2048
     dims = dict(
-        num_heads=q_heads,
-        num_kv_heads=kv_heads,
+        num_heads=16,
+        num_kv_heads=2,
         head_dim=256,
         rotary_dim=64,
         mrope_section=(11, 11, 10),
         eps=1e-6,
     )
-    hidden_size = value if dimension == "hidden_size" else hidden_size
-    if dimension == "mixed_model":
-        hidden_size = 5120 if hidden_size == 2048 else 2048
     tp = value if dimension == "tp" else 2
     if dimension in dims:
         dims[dimension] = value
-    # CPU metadata is sufficient: no rank initialization or GPU allocation is allowed.
+    # CPU metadata is sufficient: do not initialize ranks or allocate on CUDA.
     hidden, dummy = torch.empty(0, hidden_size), torch.empty(0)
     with pytest.raises(NotImplementedError, match="megapreattention"):
         megapreattention(

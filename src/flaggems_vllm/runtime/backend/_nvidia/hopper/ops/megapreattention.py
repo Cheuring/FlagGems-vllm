@@ -891,14 +891,6 @@ class _DevicePrefill:
             raise NotImplementedError(
                 "DevicePrefill requires contiguous rank-local BF16 hidden"
             )
-        if (
-            x.hidden.dtype != torch.bfloat16
-            or c.num_kv_heads not in (1, 2)
-            or c.head_dim != 256
-        ):
-            raise NotImplementedError(
-                "DevicePrefill requires BF16, head_dim=256 and one or two local KV heads"
-            )
         # Keep a dynamic tail for producers after communication and for load balance.
         # Align the static prefix so every compute CTA owns the same tile count.
         num_tiles = (t // 128) * 2 * (c.num_q_heads + c.num_kv_heads)
@@ -974,14 +966,6 @@ def _validate_input(inputs):
     if inputs.hidden.device.type != "cuda":
         raise NotImplementedError("only CUDA tensors are supported")
     c, t, tp = inputs.config, inputs.positions.shape[1], inputs.group.size()
-    if tp not in (2, 4, 8) or (
-        c.hidden_size,
-        c.num_q_heads * tp,
-        c.num_kv_heads,
-    ) not in ((2048, 16, 1), (5120, 24, max(1, 4 // tp))):
-        raise NotImplementedError(
-            "only megapreattention TP2/TP4/TP8 head layouts are supported"
-        )
     if (c.head_dim, c.rotary_dim, c.mrope_section, c.eps) != (
         256,
         64,
@@ -1077,17 +1061,21 @@ def megapreattention(
 ):
     """AllGather, gated QKV projection, Gemma RMSNorm/MRoPE and KV-cache update.
 
-    Model dimensions are global (before tensor parallel sharding). Currently
-    supports (H,Q,KV)=(2048,16,2) or (5120,24,4), with D=256, rotary_dim=64,
-    sections=(11,11,10), eps=1e-6, BF16, TP2/4/8 on SM90 GPUs with at least
-    128 SMs. KV heads are replicated when TP exceeds the global KV count.
-    Other dimensions
-    raise NotImplementedError before collective allocation; there is no fallback.
+    Head counts are global (before tensor parallel sharding). Hidden width
+    must be a multiple of 64 and at least 256. Q heads must divide evenly
+    across TP2/4/8; KV heads are evenly sharded or replicated across ranks.
+    Model sizes are not restricted to a named architecture. Performance has
+    only been measured for the documented benchmark shapes.
+
+    The kernel requires D=256, rotary_dim=64, sections=(11,11,10), eps=1e-6,
+    BF16 and SM90 GPUs with at least 128 SMs. These are implementation
+    constraints, independent of the model's hidden width or head counts.
 
     hidden is contiguous [T/TP, H]. weight is contiguous
     [2 * (local_q_heads + local_kv_heads) * D, H], packed as interleaved Q/gate
-    per query head, then all K heads, then all V heads. positions is int64 [3,T]; cos_sin_cache is
-    BF16 [max_position, rotary_dim]. Norm weights are [D] (Gemma uses 1+w).
+    per query head, then all K heads, then all V heads. positions is int64
+    [3,T]; cos_sin_cache is BF16 [max_position, rotary_dim]. Norm weights are
+    [D] (Gemma uses 1+w).
     kv_cache is [blocks, local_kv_heads, block_size, 2*D], with K then V;
     valid slots must be unique and in bounds, and negative slots are ignored.
     Positions must index cos_sin_cache. No tensor-value scans are performed.
@@ -1105,24 +1093,40 @@ def megapreattention(
     on all ranks. Independent per-rank tuning can deadlock this protocol.
     The validated offline policy is kept in _select_device_policy.
     """
-    if (
-        hidden.ndim != 2
-        or (hidden.shape[1], num_heads, num_kv_heads)
-        not in ((2048, 16, 2), (5120, 24, 4))
-        or (head_dim, rotary_dim, tuple(mrope_section), eps)
-        != (256, 64, (11, 11, 10), 1e-6)
+    if hidden.ndim != 2:
+        raise NotImplementedError("megapreattention requires rank-local [T/TP,H] hidden")
+    tp = group.size()
+    if tp not in (2, 4, 8):
+        raise NotImplementedError("megapreattention requires TP2/TP4/TP8")
+    # Complete K64 tiles are required by the descriptors and four-stage fallback.
+    if hidden.shape[1] < 256 or hidden.shape[1] % 64:
+        raise NotImplementedError(
+            "megapreattention requires H>=256 and complete 64-column hidden tiles"
+        )
+    if num_heads <= 0 or num_heads % tp:
+        raise NotImplementedError(
+            "megapreattention requires a positive Q head count divisible by TP"
+        )
+    if num_kv_heads <= 0 or (
+        num_kv_heads % tp if num_kv_heads >= tp else tp % num_kv_heads
     ):
         raise NotImplementedError(
-            "megapreattention supports H2048/Q16/KV2 or H5120/Q24/KV4 with D256/R64, "
-            "mrope_section=(11,11,10), eps=1e-6 only"
+            "megapreattention requires evenly sharded or replicated KV heads"
         )
-    if group.size() not in (2, 4, 8):
-        raise NotImplementedError("megapreattention requires TP2/TP4/TP8")
+    if (head_dim, rotary_dim, tuple(mrope_section), eps) != (
+        256,
+        64,
+        (11, 11, 10),
+        1e-6,
+    ):
+        raise NotImplementedError(
+            "megapreattention requires D256/R64, mrope_section=(11,11,10), eps=1e-6"
+        )
     if tle is None:
         raise NotImplementedError("megapreattention requires FlagTree/TLE >= 3.6")
     config = _Config(
-        num_heads // group.size(),
-        max(1, num_kv_heads // group.size()),
+        num_heads // tp,
+        max(1, num_kv_heads // tp),
         head_dim,
         rotary_dim,
         tuple(mrope_section),

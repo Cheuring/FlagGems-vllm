@@ -658,8 +658,11 @@ def run_distributed(
     import torch.multiprocessing as mp
 
     model_dims = tuple(model_dims)
-    if model_dims not in ((2048, 16, 2), (5120, 24, 4)):
-        raise ValueError(f"unsupported model dimensions: {model_dims}")
+    if len(model_dims) != 3 or any(dimension <= 0 for dimension in model_dims):
+        raise ValueError("model_dims must contain positive hidden, Q and KV sizes")
+    _, q_heads, kv_heads = model_dims
+    if q_heads % tp or (kv_heads % tp if kv_heads >= tp else tp % kv_heads):
+        raise ValueError("head counts must shard or replicate evenly across TP")
     reports = []
     for round_index in range(rounds):
         with tempfile.TemporaryDirectory(prefix="megapreattention-") as directory:
