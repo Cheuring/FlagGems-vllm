@@ -224,13 +224,6 @@ class _MappedCommunicator:
             self.peers, tuple(self.mapping.buffer_ptrs), num_warps=1
         )
         assert all(p % 16 == 0 for p in self.mapping.buffer_ptrs)
-        self.probe = {
-            "backend": "PyTorch registration only; TLE data + synchronization",
-            "data_ptr": self.buffer.data_ptr(),
-            "signal_words": self.flag_words,
-            "handshake_words": self.handshake_words,
-            "ready_words": self.ready_words,
-        }
         torch.cuda.synchronize()
         dist.barrier(group=group)
 
@@ -877,6 +870,24 @@ def _select_device_policy(tp, tokens, sm_count, hidden_size):
     )
 
 
+@triton.jit
+def _copy_tma_input(source, destination, N: tl.constexpr, BLOCK: tl.constexpr):
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    value = tl.load(source + offset, offset < N, other=0)
+    tl.store(destination + offset, value, offset < N)
+
+
+def _align_tma_input(value):
+    """Stage exceptional layouts with fixed copy tiles; no online autotuning."""
+    if value.data_ptr() % 16 == 0:
+        return value
+    aligned = torch.empty_like(value)
+    _copy_tma_input[(triton.cdiv(value.numel(), 1024),)](
+        value, aligned, value.numel(), BLOCK=1024, num_warps=4
+    )
+    return aligned
+
+
 class _DevicePrefill:
     """Fixed-shape persistent window. Create during warmup; close after graph reset.
 
@@ -916,6 +927,10 @@ class _DevicePrefill:
             raise NotImplementedError(
                 "DevicePrefill requires contiguous rank-local BF16 hidden"
             )
+        # Preserve the same collective protocol even when only one rank has
+        # offset views. Copy on every call so Graph replay also sees new data.
+        hidden = _align_tma_input(x.hidden)
+        weight = _align_tma_input(x.weight)
         # Keep a dynamic tail for producers after communication and for load balance.
         # Align the static prefix so every compute CTA owns the same tile count.
         num_tiles = (t // 128) * 2 * (c.num_q_heads + c.num_kv_heads)
@@ -941,14 +956,14 @@ class _DevicePrefill:
         kernel = _persistent[(policy.programs,)](
             bulk,
             rt.work_queue,
-            x.hidden,
+            hidden,
             rt.buffer,
             rt.peers,
             rt.counters,
             rt.rank,
             TensorDescriptor.from_tensor(rt.buffer, [128, 64]),
-            TensorDescriptor.from_tensor(x.hidden, [128, 64]),
-            TensorDescriptor.from_tensor(x.weight, [256, 64]),
+            TensorDescriptor.from_tensor(hidden, [128, 64]),
+            TensorDescriptor.from_tensor(weight, [256, 64]),
             q,
             k,
             v,
@@ -1412,6 +1427,8 @@ def megapreattention(
     (H>=256), tokens have complete M128 tiles per rank (T>=1024), and the GPU
     has at least128SMs. Other legal dimensions use a general Triton path;
     performance is not guaranteed outside the benchmark shapes.
+    Contiguous inputs with unaligned base addresses use a Triton staging copy
+    on the persistent path; all ranks retain the same communication protocol.
 
     hidden is contiguous [T/TP, H]. weight is contiguous
     [2 * (local_q_heads + local_kv_heads) * D, H], packed as interleaved Q/gate

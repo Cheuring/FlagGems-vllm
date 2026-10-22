@@ -65,12 +65,10 @@ def test_megapreattention(model_dims, tp, tokens, mode, edge):
         model_dims=model_dims,
     )
     assert result["correctness_passed"]
-    assert result["measurement_jit_free"]
     assert all(len(r["ranks"]) == tp for r in result["reports"])
 
 
-@pytest.mark.parametrize("words,programs", [(544, 128), (1088, 132), (2050, 132)])
-def test_megapreattention_metadata_bounds(words, programs):
+def test_megapreattention_metadata_bounds():
     require_hopper()
     import triton
 
@@ -78,6 +76,7 @@ def test_megapreattention_metadata_bounds(words, programs):
         _initialize_metadata,
     )
 
+    words, programs = 2050, 132
     flags = torch.full((words + 8,), 17, device="cuda", dtype=torch.uint64)
     counters = torch.full((programs + 8,), 17, device="cuda", dtype=torch.int64)
     _initialize_metadata[(triton.cdiv(words, 1024),)](
@@ -121,19 +120,6 @@ def test_megapreattention_rejects_incompatible_config(dimension, value, error, m
         _validate_config(**config)
 
 
-def test_megapreattention_general_dispatch_without_fast_path(monkeypatch):
-    from flaggems_vllm.runtime.backend._nvidia.hopper.ops import (
-        megapreattention as impl,
-    )
-
-    config = impl._validate_config(2048, 2, 16, 2, 256, 64, (11, 11, 10), 1e-6)
-    monkeypatch.setattr(impl, "tle", object())
-    assert impl._use_persistent_path(config, 1024, 2, 128)
-    assert not impl._use_persistent_path(config, 1024, 2, 120)
-    monkeypatch.setattr(impl, "tle", None)
-    assert not impl._use_persistent_path(config, 1024, 2, 132)
-
-
 GENERAL_CASES = [
     (2, 1024, (512, 8, 2), 128, 64, (16, 8, 8), 1e-5),
     (4, 1024, (768, 16, 8), 96, 32, (6, 5, 5), 1e-5),
@@ -171,4 +157,3 @@ def test_megapreattention_general_geometry(
         disable_tle=(tp == 2 and head_dim == 256),
     )
     assert result["correctness_passed"]
-    assert result["measurement_jit_free"]

@@ -425,6 +425,40 @@ def check_outputs(actual, expected, actual_cache, expected_cache):
     return result
 
 
+def check_unaligned_inputs(inputs):
+    """Exercise cached TMA inputs and Graph replay with only rank zero offset."""
+    for field in ("hidden", "weight"):
+        value = getattr(inputs, field)
+        offset = int(dist.get_rank(inputs.group) == 0)
+        storage = torch.empty(
+            value.numel() + offset, device=value.device, dtype=value.dtype
+        )
+        changed = storage[offset:].view(value.shape)
+        changed.copy_(value)
+        candidate = replace(
+            inputs, **{field: changed}, cache=torch.full_like(inputs.cache, 0.375)
+        )
+        assert changed.is_contiguous() and changed.data_ptr() % 16 == offset * 2
+        # An aligned invocation has already populated the runtime cache.
+        run_candidate(candidate)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run_candidate(candidate)
+        try:
+            for scale in (-0.75, -1.25):
+                changed.mul_(scale)
+                candidate.cache.fill_(0.375)
+                reference_cache = torch.full_like(candidate.cache, 0.375)
+                expected = independent_reference(
+                    replace(candidate, cache=reference_cache)
+                )
+                graph.replay()
+                torch.cuda.synchronize()
+                check_outputs(actual, expected, candidate.cache, reference_cache)
+        finally:
+            graph.reset()
+
+
 def distribution(samples):
     ordered = sorted(samples)
 
@@ -589,6 +623,8 @@ def _worker(
         and model_dims == (2048, 16, 2)
         and kernel_config["eps"] == 1e-6
     )
+    if check_metadata:
+        check_unaligned_inputs(inputs["megapreattention"])
     for name in ("megapreattention",) if check_metadata else ():
         value = inputs[name]
         bad_cases = {
@@ -626,17 +662,17 @@ def _worker(
         del bad_cases
 
     samples = {name: {"wall": [], "device": []} for name in names}
-    compilations = []
-    original_compile = JITFunction._do_compile
+    if not check_only:
+        compilations = []
+        original_compile = JITFunction._do_compile
 
-    def track_compile(*args, **kwargs):
-        compilations.append(True)
-        return original_compile(*args, **kwargs)
+        def track_compile(*args, **kwargs):
+            compilations.append(True)
+            return original_compile(*args, **kwargs)
 
-    before_dynamo = dict(dynamo_counters["stats"])
-    JITFunction._do_compile = track_compile
-    try:
-        if not check_only:
+        before_dynamo = dict(dynamo_counters["stats"])
+        JITFunction._do_compile = track_compile
+        try:
             for repeat in range(iterations):
                 shift = repeat % len(names)
                 for name in names[shift:] + names[:shift]:
@@ -654,18 +690,18 @@ def _worker(
                         (time.perf_counter_ns() - begin) / 1.0e6
                     )
                     samples[name]["device"].append(start.elapsed_time(end))
-    finally:
-        JITFunction._do_compile = original_compile
-    assert not compilations, "measurement triggered TLE/Triton JIT"
-    assert before_dynamo == dict(
-        dynamo_counters["stats"]
-    ), "measurement triggered Dynamo recompilation"
+        finally:
+            JITFunction._do_compile = original_compile
+        assert not compilations, "measurement triggered TLE/Triton JIT"
+        assert before_dynamo == dict(
+            dynamo_counters["stats"]
+        ), "measurement triggered Dynamo recompilation"
     record = {
         "rank": rank,
         "samples": samples,
         "checks": checks,
         "unsupported": unsupported,
-        "jit_free": True,
+        "jit_free": None if check_only else True,
         "native_source": native.source_evidence,
     }
     ranks = [None] * tp
@@ -705,7 +741,7 @@ def _worker(
             "edge": edge,
             "scope": "BF16 megapreattention window, not complete model inference",
             "correctness_passed": True,
-            "measurement_jit_free": True,
+            "measurement_jit_free": None if check_only else True,
             "iterations": iterations,
             "warmup": warmup,
             "metrics": metrics,
@@ -737,6 +773,7 @@ def run_distributed(
     eps=1e-6,
     disable_tle=False,
 ):
+    """Run independent rounds; JIT-free metadata is None without measurement."""
     import torch.multiprocessing as mp
 
     model_dims = tuple(model_dims)
@@ -823,7 +860,7 @@ def run_distributed(
         "tokens": tokens,
         "mode": mode,
         "correctness_passed": True,
-        "measurement_jit_free": True,
+        "measurement_jit_free": None if check_only else True,
         "summary": summary,
         "reports": reports,
     }
